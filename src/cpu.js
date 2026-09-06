@@ -365,6 +365,11 @@ CPU.prototype.wasm_patch = function()
 
     this.main_loop = get_import("main_loop");
 
+    // Runs the guest for a bounded number of instructions and reports how many
+    // it retired, so a scheduler can preempt on guest progress rather than on
+    // wall clock. See run_slice in cpu.rs.
+    this.run_slice = get_import("run_slice");
+
     this.set_jit_config = get_import("set_jit_config");
 
     this.read8 = get_import("read8");

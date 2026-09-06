@@ -3313,6 +3313,33 @@ pub unsafe fn do_many_cycles_native() {
     }
 }
 
+/// Runs the guest for at most `max_instructions`, returning how many it retired.
+///
+/// `main_loop` bounds a slice by wall clock (`TIME_PER_FRAME`) quantised by
+/// `LOOP_COUNTER`, which makes the preemption point a function of host speed:
+/// the same guest is interrupted in a different place on a faster machine. A
+/// scheduler that has to hand the CPU to another thread after a fixed amount of
+/// *guest* progress needs the bound expressed in retired instructions instead.
+///
+/// Timers and interrupts are deliberately not driven here: this runs guest
+/// instructions and nothing else, so the caller decides when devices get a turn.
+/// `in_hlt` still ends the slice early, so a halted guest costs nothing.
+///
+/// Note the granularity this can offer. The check happens between
+/// `cycle_internal` calls, so a slice can overrun by one block; and the JIT
+/// compiles its own loop-safety check against the `LOOP_COUNTER` constant, so a
+/// block containing an internal loop can run up to that many iterations before
+/// returning here regardless of `max_instructions`. Tightening that further
+/// means emitting a load from a global in the generated code.
+#[no_mangle]
+pub unsafe fn run_slice(max_instructions: u32) -> u32 {
+    let start = *instruction_counter;
+    while (*instruction_counter).wrapping_sub(start) < max_instructions && !*in_hlt {
+        cycle_internal();
+    }
+    (*instruction_counter).wrapping_sub(start)
+}
+
 #[cold]
 pub unsafe fn trigger_de() {
     dbg_log!("#de");
