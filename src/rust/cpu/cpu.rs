@@ -333,7 +333,9 @@ pub unsafe fn bottlify_stat(index: u32) -> f64 {
 /// `PROFILE_HITS` how often the address was entered, so that a block run a
 /// million times reads apart from a long block run once. What the table has
 /// no room for is counted in `PROFILE_DROPPED` rather than lost in silence.
-pub const PROFILE_SLOTS: usize = 1 << 16;
+/// A title's code is hundreds of thousands of blocks once its loading has run;
+/// a smaller table dropped more than it kept.
+pub const PROFILE_SLOTS: usize = 1 << 20;
 const PROFILE_PROBES: usize = 32;
 pub static mut PROFILE_ON: bool = false;
 pub static mut PROFILE_KEYS: [u32; PROFILE_SLOTS] = [0; PROFILE_SLOTS];
