@@ -317,6 +317,79 @@ pub unsafe fn bottlify_stat(index: u32) -> f64 {
     if (index as usize) < STAT_COUNT { STATS[index as usize] as f64 } else { -1.0 }
 }
 
+/// Where the guest ran, by address, weighted by instructions retired.
+///
+/// A sample taken where a slice stops lands on whatever stopped it -- a trap,
+/// a quantum -- and attributes everything before it to that address, which is
+/// a rumour about the code in between. This is the account instead: while it
+/// is switched on, every compiled block counts itself on entry, with the
+/// address it starts at and the instructions it holds, and the interpreter
+/// counts each instruction it runs. Compiled code carries the count only when
+/// compiled with the profile on, so switching it on or off is followed by a
+/// cache clear, and code compiled with it off costs nothing.
+///
+/// An open-addressed table keyed by address: `PROFILE_KEYS` holds the address
+/// plus one (zero is empty), `PROFILE_WEIGHTS` the instructions, and
+/// `PROFILE_HITS` how often the address was entered, so that a block run a
+/// million times reads apart from a long block run once. What the table has
+/// no room for is counted in `PROFILE_DROPPED` rather than lost in silence.
+pub const PROFILE_SLOTS: usize = 1 << 16;
+const PROFILE_PROBES: usize = 32;
+pub static mut PROFILE_ON: bool = false;
+pub static mut PROFILE_KEYS: [u32; PROFILE_SLOTS] = [0; PROFILE_SLOTS];
+pub static mut PROFILE_WEIGHTS: [u32; PROFILE_SLOTS] = [0; PROFILE_SLOTS];
+pub static mut PROFILE_HITS: [u32; PROFILE_SLOTS] = [0; PROFILE_SLOTS];
+pub static mut PROFILE_DROPPED: u32 = 0;
+
+#[no_mangle]
+pub unsafe fn profile_hit(addr: u32, weight: u32) {
+    let key = addr.wrapping_add(1);
+    let mut slot = (addr.wrapping_mul(0x9E37_79B1) >> 16) as usize & (PROFILE_SLOTS - 1);
+    for _ in 0..PROFILE_PROBES {
+        let found = PROFILE_KEYS[slot];
+        if found == key {
+            PROFILE_WEIGHTS[slot] = PROFILE_WEIGHTS[slot].wrapping_add(weight);
+            PROFILE_HITS[slot] = PROFILE_HITS[slot].wrapping_add(1);
+            return;
+        }
+        if found == 0 {
+            PROFILE_KEYS[slot] = key;
+            PROFILE_WEIGHTS[slot] = weight;
+            PROFILE_HITS[slot] = 1;
+            return;
+        }
+        slot = (slot + 1) & (PROFILE_SLOTS - 1);
+    }
+    PROFILE_DROPPED = PROFILE_DROPPED.wrapping_add(weight);
+}
+
+/// Switches the account on or off. The caller clears the compiled code after,
+/// so that every block is compiled again with or without its count.
+#[no_mangle]
+pub unsafe fn profile_set(on: u32) { PROFILE_ON = on != 0; }
+
+#[no_mangle]
+pub unsafe fn profile_get() -> u32 { PROFILE_ON as u32 }
+
+#[no_mangle]
+pub unsafe fn profile_reset() {
+    PROFILE_KEYS = [0; PROFILE_SLOTS];
+    PROFILE_WEIGHTS = [0; PROFILE_SLOTS];
+    PROFILE_HITS = [0; PROFILE_SLOTS];
+    PROFILE_DROPPED = 0;
+}
+
+#[no_mangle]
+pub unsafe fn profile_slots() -> u32 { PROFILE_SLOTS as u32 }
+#[no_mangle]
+pub unsafe fn profile_keys_ptr() -> u32 { core::ptr::addr_of!(PROFILE_KEYS) as u32 }
+#[no_mangle]
+pub unsafe fn profile_weights_ptr() -> u32 { core::ptr::addr_of!(PROFILE_WEIGHTS) as u32 }
+#[no_mangle]
+pub unsafe fn profile_hits_ptr() -> u32 { core::ptr::addr_of!(PROFILE_HITS) as u32 }
+#[no_mangle]
+pub unsafe fn profile_dropped() -> u32 { PROFILE_DROPPED }
+
 // should probably be kept in sync with APIC_TIMER_FREQ in apic.js
 pub const TSC_RATE: f64 = 1_000_000.0;
 
@@ -3238,6 +3311,9 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32) {
 
         i += 1;
         let start_eip = *instruction_pointer;
+        if PROFILE_ON {
+            profile_hit(start_eip as u32, 1);
+        }
         let opcode = *memory::mem8.offset(phys_addr as isize) as i32;
         *instruction_pointer += 1;
         dbg_assert!(*prefixes == 0);

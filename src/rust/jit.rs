@@ -2080,6 +2080,18 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
         ctx.builder.call_fn1("enter_basic_block");
     }
 
+    // The block counts itself where the guest ran, when the account is on:
+    // see `cpu::profile_hit`. Decided when the block is compiled, so a block
+    // compiled with the account off carries nothing.
+    if unsafe { cpu::PROFILE_ON } {
+        codegen::gen_fn2_const(
+            ctx.builder,
+            "profile_hit",
+            start_addr,
+            block.number_of_instructions,
+        );
+    }
+
     ctx.builder.get_local(&ctx.instruction_counter);
     ctx.builder.const_i32(block.number_of_instructions as i32);
     ctx.builder.add_i32();
