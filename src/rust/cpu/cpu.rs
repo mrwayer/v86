@@ -288,6 +288,35 @@ pub const DEBUG: bool = cfg!(debug_assertions);
 
 pub const LOOP_COUNTER: i32 = 100_003;
 
+/// A handful of counters that are always on.
+///
+/// The emulator's own statistics are compiled out of a release build and answer
+/// zero, which is worse than absent: a caller reads a plausible number and
+/// believes it. These few cost an increment on paths that already cost far
+/// more, and they answer the questions a frame rate actually raises -- how much
+/// of the guest runs compiled rather than interpreted, and how much of its
+/// arithmetic goes through the 80-bit software float.
+///
+/// 0: instructions retired inside generated code
+/// 1: instructions retired by the interpreter
+/// 2: entries into generated code
+/// 3: interpreted dispatches
+/// 4: conversions in or out of the 80-bit float
+pub const STAT_COUNT: usize = 5;
+pub static mut STATS: [u64; STAT_COUNT] = [0; STAT_COUNT];
+
+#[inline(always)]
+pub unsafe fn note_stat(index: usize, by: u64) { STATS[index] = STATS[index].wrapping_add(by); }
+
+#[inline(always)]
+pub unsafe fn note_f80_conversion() { note_stat(4, 1) }
+
+/// Reads one of them. `f64` because a `u64` does not cross into JS as a number.
+#[no_mangle]
+pub unsafe fn bottlify_stat(index: u32) -> f64 {
+    if (index as usize) < STAT_COUNT { STATS[index as usize] as f64 } else { -1.0 }
+}
+
 // should probably be kept in sync with APIC_TIMER_FREQ in apic.js
 pub const TSC_RATE: f64 = 1_000_000.0;
 
@@ -3091,6 +3120,8 @@ pub unsafe fn cycle_internal() {
         {
             in_jit = false;
         }
+        note_stat(0, (*instruction_counter).wrapping_sub(initial_instruction_counter) as u64);
+        note_stat(2, 1);
         profiler::stat_increment_by(
             stat::RUN_FROM_CACHE_STEPS,
             (*instruction_counter - initial_instruction_counter) as u64,
@@ -3155,6 +3186,8 @@ pub unsafe fn cycle_internal() {
 
         let initial_instruction_counter = *instruction_counter;
         jit_run_interpreted(phys_addr);
+        note_stat(1, (*instruction_counter).wrapping_sub(initial_instruction_counter) as u64);
+        note_stat(3, 1);
 
         jit::jit_increase_hotness_and_maybe_compile(
             initial_eip,

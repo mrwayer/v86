@@ -108,6 +108,7 @@ impl F80 {
     }
 
     pub fn of_f64(src: u64) -> F80 {
+        unsafe { crate::cpu::cpu::note_f80_conversion() };
         let mut x = F80::ZERO;
         unsafe { f64_to_extF80M(src, &mut x) };
         x
@@ -115,7 +116,12 @@ impl F80 {
     fn of_f64x(src: f64) -> F80 { F80::of_f64(f64::to_bits(src)) }
 
     pub fn to_f32(&self) -> i32 { unsafe { extF80M_to_f32(self) } }
-    pub fn to_f64(&self) -> u64 { unsafe { extF80M_to_f64(self) } }
+    pub fn to_f64(&self) -> u64 {
+        unsafe {
+            crate::cpu::cpu::note_f80_conversion();
+            extF80M_to_f64(self)
+        }
+    }
     fn to_f64x(&self) -> f64 { f64::from_bits(self.to_f64()) }
 
     pub fn to_i32(&self) -> i32 { unsafe { extF80M_to_i32(self, softfloat_roundingMode, false) } }
