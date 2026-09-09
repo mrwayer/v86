@@ -3325,11 +3325,16 @@ pub unsafe fn do_many_cycles_native() {
 /// instructions and nothing else, so the caller decides when devices get a turn.
 /// `in_hlt` still ends the slice early, so a halted guest costs nothing.
 ///
-/// The check happens between `cycle_internal` calls, so a slice can still
-/// overrun by one block. What it no longer overruns by is `LOOP_COUNTER`: the
-/// generated code reads its loop bound from `jit_loop_counter`, which this sets
-/// for the length of the slice, so a block that loops returns here when the
-/// slice is spent instead of a hundred thousand instructions later.
+/// The bound handed to the generated code is what is *left* of the slice, not
+/// the whole of it. Giving it the whole slice each time bounds the overrun by
+/// the slice rather than removing it: the check happens between entries into
+/// generated code, so an entry made with one instruction of budget left may
+/// still run a full slice's worth, and a slice of a hundred thousand retires
+/// nearly two hundred thousand. Measured on a real title, two turns in three
+/// ran past their quantum and the worst ran exactly twice it.
+///
+/// With the remainder, what is left to overrun by is a single basic block,
+/// which is as close as this can get without counting inside one.
 ///
 /// Every block obeys it, whenever it was compiled: the bound is read at the top
 /// of each iteration rather than compiled into the block, which is the whole
@@ -3337,13 +3342,18 @@ pub unsafe fn do_many_cycles_native() {
 #[no_mangle]
 pub unsafe fn run_slice(max_instructions: u32) -> u32 {
     let outer_bound = *jit_loop_counter;
-    // Never above the ceiling the compiler was built around, and never zero:
-    // zero would mean "already over budget" to every generated block, and the
-    // guest would retire nothing at all.
-    *jit_loop_counter = max_instructions.min(LOOP_COUNTER as u32).max(1) as i32;
-
     let start = *instruction_counter;
-    while (*instruction_counter).wrapping_sub(start) < max_instructions && !*in_hlt {
+
+    loop {
+        let retired = (*instruction_counter).wrapping_sub(start);
+        if retired >= max_instructions || *in_hlt {
+            break;
+        }
+        // Never above the ceiling the compiler was built around, and never
+        // zero: zero would mean "already over budget" to every generated block,
+        // and the guest would retire nothing at all.
+        let left = max_instructions - retired;
+        *jit_loop_counter = left.min(LOOP_COUNTER as u32).max(1) as i32;
         cycle_internal();
     }
 
