@@ -32,6 +32,13 @@ pub const in_hlt: *mut bool = 616 as *mut bool;
 pub const last_virt_eip: *mut i32 = 620 as *mut i32;
 pub const eip_phys: *mut i32 = 624 as *mut i32;
 
+/// How many instructions a generated block may run before it returns.
+///
+/// Read by generated code rather than compiled into it, so that a caller
+/// bounding a slice can be obeyed inside a block that loops. `LOOP_COUNTER`
+/// remains the ceiling and the default.
+pub const jit_loop_counter: *mut i32 = 628 as *mut i32;
+
 pub const sysenter_cs: *mut i32 = 636 as *mut i32;
 pub const sysenter_esp: *mut i32 = 640 as *mut i32;
 pub const sysenter_eip: *mut i32 = 644 as *mut i32;

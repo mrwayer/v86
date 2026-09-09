@@ -3325,18 +3325,29 @@ pub unsafe fn do_many_cycles_native() {
 /// instructions and nothing else, so the caller decides when devices get a turn.
 /// `in_hlt` still ends the slice early, so a halted guest costs nothing.
 ///
-/// Note the granularity this can offer. The check happens between
-/// `cycle_internal` calls, so a slice can overrun by one block; and the JIT
-/// compiles its own loop-safety check against the `LOOP_COUNTER` constant, so a
-/// block containing an internal loop can run up to that many iterations before
-/// returning here regardless of `max_instructions`. Tightening that further
-/// means emitting a load from a global in the generated code.
+/// The check happens between `cycle_internal` calls, so a slice can still
+/// overrun by one block. What it no longer overruns by is `LOOP_COUNTER`: the
+/// generated code reads its loop bound from `jit_loop_counter`, which this sets
+/// for the length of the slice, so a block that loops returns here when the
+/// slice is spent instead of a hundred thousand instructions later.
+///
+/// Every block obeys it, whenever it was compiled: the bound is read at the top
+/// of each iteration rather than compiled into the block, which is the whole
+/// difference from the constant this replaced.
 #[no_mangle]
 pub unsafe fn run_slice(max_instructions: u32) -> u32 {
+    let outer_bound = *jit_loop_counter;
+    // Never above the ceiling the compiler was built around, and never zero:
+    // zero would mean "already over budget" to every generated block, and the
+    // guest would retire nothing at all.
+    *jit_loop_counter = max_instructions.min(LOOP_COUNTER as u32).max(1) as i32;
+
     let start = *instruction_counter;
     while (*instruction_counter).wrapping_sub(start) < max_instructions && !*in_hlt {
         cycle_internal();
     }
+
+    *jit_loop_counter = outer_bound;
     (*instruction_counter).wrapping_sub(start)
 }
 
@@ -4618,6 +4629,10 @@ pub unsafe fn reset_cpu() {
     *fpu_dp_selector = 0;
 
     *mxcsr = 0x1F80;
+
+    // Generated code compares against this, and memory starts as zeroes: left
+    // at zero every block would exit before its first instruction.
+    *jit_loop_counter = LOOP_COUNTER;
 
     full_clear_tlb();
 
