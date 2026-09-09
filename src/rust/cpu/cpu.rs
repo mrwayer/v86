@@ -3250,6 +3250,14 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32) {
                 // block boundaries for the interpreter, but only on the next backwards jump
             || (i >= INTERPRETER_ITERATION_LIMIT
                 && (start_eip as u32) >= (*instruction_pointer as u32))
+            // The bound a slice runs under. Generated code reads it at every loop head;
+            // this loop is the other place a page's worth of instructions runs without
+            // returning to run_slice, and a hot loop that has not been compiled yet sat
+            // here for the iteration limit above, whatever the slice had left. Measured
+            // on a real title, that was the whole of the overrun: a slice of a hundred
+            // thousand retiring two hundred thousand, with nothing compiled in the
+            // second hundred thousand.
+            || i >= *jit_loop_counter as u32
         {
             break;
         }
@@ -3367,7 +3375,9 @@ pub unsafe fn do_many_cycles_native() {
 /// ran past their quantum and the worst ran exactly twice it.
 ///
 /// With the remainder, what is left to overrun by is a single basic block,
-/// which is as close as this can get without counting inside one.
+/// which is as close as this can get without counting inside one. The
+/// interpreter reads the same bound, so a page that is not compiled yet does
+/// not overrun at all.
 ///
 /// Every block obeys it, whenever it was compiled: the bound is read at the top
 /// of each iteration rather than compiled into the block, which is the whole
