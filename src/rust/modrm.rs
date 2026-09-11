@@ -8,6 +8,9 @@ use crate::regs::{BP, BX, DI, SI};
 use crate::regs::{CS, DS, ES, FS, GS, SS};
 use crate::regs::{EAX, EBP, EBX, ECX, EDI, EDX, ESI, ESP};
 
+// Copied where an instruction is emitted along two paths, the inline one and
+// the helper's, each of which resolves the operand for itself.
+#[derive(Copy, Clone)]
 pub struct ModrmByte {
     segment: u32,
     first_reg: Option<u32>,
