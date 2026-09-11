@@ -29,6 +29,22 @@ pub fn fpu_write_st(index: i32, value: F80) {
     }
 }
 
+/// The tag generated code leaves in a register's exponent word when it
+/// stores a double there: the mantissa word then holds the double's bits.
+/// Every reader on this side turns such a register back into the 80-bit
+/// format before it is used, so the arithmetic below never sees the tag.
+pub const FPU_RELAXED_TAG: u16 = 0x7FFE;
+
+/// The register as an 80-bit value, whichever form it was left in.
+pub fn fpu_canonical(x: F80) -> F80 {
+    if x.sign_exponent == FPU_RELAXED_TAG {
+        F80::of_f64(x.mantissa)
+    }
+    else {
+        x
+    }
+}
+
 pub unsafe fn fpu_get_st0() -> F80 {
     dbg_assert!(*fpu_stack_ptr < 8);
     if 0 != *fpu_stack_empty >> *fpu_stack_ptr & 1 {
@@ -37,7 +53,7 @@ pub unsafe fn fpu_get_st0() -> F80 {
         return F80::INDEFINITE_NAN;
     }
     else {
-        return *fpu_st.offset(*fpu_stack_ptr as isize);
+        return fpu_canonical(*fpu_st.offset(*fpu_stack_ptr as isize));
     };
 }
 pub unsafe fn fpu_stack_fault() {
@@ -73,7 +89,7 @@ pub unsafe fn fpu_get_sti(mut i: i32) -> F80 {
         return F80::INDEFINITE_NAN;
     }
     else {
-        return *fpu_st.offset(i as isize);
+        return fpu_canonical(*fpu_st.offset(i as isize));
     };
 }
 
@@ -543,7 +559,7 @@ pub unsafe fn fpu_fsave32(mut addr: i32) {
     addr += 28;
     for i in 0..8 {
         let reg_index = i + *fpu_stack_ptr as i32 & 7;
-        fpu_store_m80(addr, *fpu_st.offset(reg_index as isize));
+        fpu_store_m80(addr, fpu_canonical(*fpu_st.offset(reg_index as isize)));
         addr += 10;
     }
     fpu_finit();
@@ -582,7 +598,7 @@ pub unsafe fn fpu_fstenv32(addr: i32) {
 pub unsafe fn fpu_load_tag_word() -> i32 {
     let mut tag_word = 0;
     for i in 0..8 {
-        let value = *fpu_st.offset(i as isize);
+        let value = fpu_canonical(*fpu_st.offset(i as isize));
         if 0 != *fpu_stack_empty >> i & 1 {
             tag_word |= 3 << (i << 1)
         }

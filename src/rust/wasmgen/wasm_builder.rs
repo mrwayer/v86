@@ -865,17 +865,21 @@ impl WasmBuilder {
     pub fn reinterpret_i32_as_f32(&mut self) {
         self.instruction_body.push(op::OP_F32REINTERPRETI32);
     }
-    //pub fn reinterpret_f32_as_i32(&mut self) {
-    //    self.instruction_body.push(op::OP_I32REINTERPRETF32);
-    //}
+    pub fn reinterpret_f32_as_i32(&mut self) {
+        self.instruction_body.push(op::OP_I32REINTERPRETF32);
+    }
     pub fn reinterpret_i64_as_f64(&mut self) {
         self.instruction_body.push(op::OP_F64REINTERPRETI64);
     }
-    //pub fn reinterpret_f64_as_i64(&mut self) {
-    //    self.instruction_body.push(op::OP_I64REINTERPRETF64);
-    //}
-    //pub fn promote_f32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64PROMOTEF32); }
-    //pub fn demote_f64_to_f32(&mut self) { self.instruction_body.push(op::OP_F32DEMOTEF64); }
+    pub fn reinterpret_f64_as_i64(&mut self) {
+        self.instruction_body.push(op::OP_I64REINTERPRETF64);
+    }
+    pub fn promote_f32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64PROMOTEF32); }
+    pub fn demote_f64_to_f32(&mut self) { self.instruction_body.push(op::OP_F32DEMOTEF64); }
+    pub fn add_f64(&mut self) { self.instruction_body.push(op::OP_F64ADD); }
+    pub fn sub_f64(&mut self) { self.instruction_body.push(op::OP_F64SUB); }
+    pub fn mul_f64(&mut self) { self.instruction_body.push(op::OP_F64MUL); }
+    pub fn div_f64(&mut self) { self.instruction_body.push(op::OP_F64DIV); }
     //pub fn convert_i32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI32); }
     //pub fn convert_i64_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI64); }
     pub fn extend_unsigned_i32_to_i64(&mut self) {

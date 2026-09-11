@@ -78,6 +78,13 @@ static mut JIT_USE_LOOP_SAFETY: bool = true;
 static mut JIT_BLOCK_CHAINING: bool = false;
 fn block_chaining_enabled() -> bool { unsafe { JIT_BLOCK_CHAINING } }
 
+// Whether x87 arithmetic, loads and stores are emitted inline as double
+// operations on registers the generated code tags as holding a double,
+// rather than each being a call with an 80-bit value passed through memory.
+// Configuration index 7. Read when a module is compiled.
+pub static mut JIT_FPU_INLINE: bool = true;
+pub fn fpu_inline_enabled() -> bool { unsafe { JIT_FPU_INLINE } }
+
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 
 // How many instructions a page runs interpreted before it is compiled. A
@@ -2641,6 +2648,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         4 => JIT_THRESHOLD = value.max(1),
         5 => crate::softfloat::FAST_F80 = value != 0,
         6 => JIT_BLOCK_CHAINING = value != 0,
+        7 => JIT_FPU_INLINE = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -2655,6 +2663,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         4 => JIT_THRESHOLD,
         5 => crate::softfloat::FAST_F80 as u32,
         6 => JIT_BLOCK_CHAINING as u32,
+        7 => JIT_FPU_INLINE as u32,
         _ => 0,
     }
 }
