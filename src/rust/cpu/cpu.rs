@@ -302,8 +302,45 @@ pub const LOOP_COUNTER: i32 = 100_003;
 /// 2: entries into generated code
 /// 3: interpreted dispatches
 /// 4: conversions in or out of the 80-bit float
-pub const STAT_COUNT: usize = 5;
+/// 5: writes that reached a page holding code, each of which walks the
+///    compiler's tables instead of taking the fast path
+/// 6: of those, ones that threw a compiled module away
+/// 7: of those, ones that threw a page's hotness away before it compiled
+pub const STAT_COUNT: usize = 8;
 pub static mut STATS: [u64; STAT_COUNT] = [0; STAT_COUNT];
+
+/// The pages written most while holding code, so a report can name them:
+/// a page that mixes data with code is written for as long as the program
+/// runs, and every write costs the slow path and, at worst, a recompile.
+pub const DIRTY_PAGES_KEPT: usize = 16;
+pub static mut DIRTY_PAGES: [u32; DIRTY_PAGES_KEPT] = [0; DIRTY_PAGES_KEPT];
+pub static mut DIRTY_COUNTS: [u64; DIRTY_PAGES_KEPT] = [0; DIRTY_PAGES_KEPT];
+
+pub unsafe fn note_dirty_page(page: u32) {
+    let mut least = 0;
+    for i in 0..DIRTY_PAGES_KEPT {
+        if DIRTY_COUNTS[i] != 0 && DIRTY_PAGES[i] == page {
+            DIRTY_COUNTS[i] += 1;
+            return;
+        }
+        if DIRTY_COUNTS[i] < DIRTY_COUNTS[least] {
+            least = i;
+        }
+    }
+    // A slot is taken from the page written least; a page that is written
+    // steadily wins it back soon enough, which is what the table is for.
+    DIRTY_PAGES[least] = page;
+    DIRTY_COUNTS[least] = 1;
+}
+
+#[no_mangle]
+pub unsafe fn bottlify_dirty_page(index: u32) -> u32 {
+    if (index as usize) < DIRTY_PAGES_KEPT { DIRTY_PAGES[index as usize] } else { 0 }
+}
+#[no_mangle]
+pub unsafe fn bottlify_dirty_count(index: u32) -> f64 {
+    if (index as usize) < DIRTY_PAGES_KEPT { DIRTY_COUNTS[index as usize] as f64 } else { -1.0 }
+}
 
 #[inline(always)]
 pub unsafe fn note_stat(index: usize, by: u64) { STATS[index] = STATS[index].wrapping_add(by); }

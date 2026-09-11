@@ -73,7 +73,11 @@ static mut JIT_USE_LOOP_SAFETY: bool = true;
 
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 
-pub const JIT_THRESHOLD: u32 = 200 * 1000;
+// How many instructions a page runs interpreted before it is compiled. A
+// knob rather than a constant: a program that keeps arriving at new code pays
+// this much slow execution for each, and the right trade against compile
+// count is a measurement, not a guess.
+pub static mut JIT_THRESHOLD: u32 = 200 * 1000;
 
 // less branches will generate if-else, more will generate brtable
 pub const BRTABLE_CUTOFF: usize = 10;
@@ -831,7 +835,7 @@ pub fn jit_force_generate_unsafe(virt_addr: i32) {
         cpu::translate_address_read(virt_addr).unwrap(),
         cpu::get_seg_cs() as u32,
         cpu::get_state_flags(),
-        JIT_THRESHOLD,
+        unsafe { JIT_THRESHOLD },
     );
     dbg_assert!(get_jit_state().compiling.is_some());
 }
@@ -2218,7 +2222,7 @@ pub fn jit_increase_hotness_and_maybe_compile(
     }
 
     *hotness += heat;
-    if *hotness >= JIT_THRESHOLD {
+    if *hotness >= unsafe { JIT_THRESHOLD } {
         if is_compiling {
             return;
         }
@@ -2284,6 +2288,10 @@ fn free_wasm_table_index(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
 /// Register a write in this page: Delete all present code
 fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
     let mut did_have_code = false;
+    unsafe {
+        cpu::note_stat(5, 1);
+        cpu::note_dirty_page(page.to_u32());
+    }
 
     if let Some(PageInfo {
         wasm_table_index,
@@ -2293,6 +2301,7 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
     }) = ctx.pages.remove(&page)
     {
         profiler::stat_increment(stat::INVALIDATE_PAGE_HAD_CODE);
+        unsafe { cpu::note_stat(6, 1) };
         did_have_code = true;
 
         free(ctx, wasm_table_index);
@@ -2353,6 +2362,7 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
         None => {},
         Some(_) => {
             profiler::stat_increment(stat::INVALIDATE_PAGE_HAD_ENTRY_POINTS);
+            unsafe { cpu::note_stat(7, 1) };
             did_have_code = true;
 
             match &ctx.compiling {
@@ -2552,6 +2562,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         1 => MAX_PAGES = value,
         2 => JIT_USE_LOOP_SAFETY = value != 0,
         3 => MAX_EXTRA_BASIC_BLOCKS = value,
+        4 => JIT_THRESHOLD = value.max(1),
         _ => dbg_assert!(false),
     }
 }
@@ -2563,6 +2574,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         1 => MAX_PAGES as u32,
         2 => JIT_USE_LOOP_SAFETY as u32,
         3 => MAX_EXTRA_BASIC_BLOCKS as u32,
+        4 => JIT_THRESHOLD,
         _ => 0,
     }
 }
