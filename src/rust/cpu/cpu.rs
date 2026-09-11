@@ -306,7 +306,10 @@ pub const LOOP_COUNTER: i32 = 100_003;
 ///    compiler's tables instead of taking the fast path
 /// 6: of those, ones that threw a compiled module away
 /// 7: of those, ones that threw a page's hotness away before it compiled
-pub const STAT_COUNT: usize = 8;
+/// 8: exits from generated code that went straight into another module
+/// 9: exits that looked for one and found none compiled
+/// 10: exits that would have chained but the slice's budget was spent
+pub const STAT_COUNT: usize = 11;
 pub static mut STATS: [u64; STAT_COUNT] = [0; STAT_COUNT];
 
 /// The pages written most while holding code, so a report can name them:
@@ -3517,10 +3520,18 @@ pub unsafe fn do_many_cycles_native() {
 /// Every block obeys it, whenever it was compiled: the bound is read at the top
 /// of each iteration rather than compiled into the block, which is the whole
 /// difference from the constant this replaced.
+/// Where the running slice began and how far it may go, for generated code
+/// that wants to go on into another module rather than return here: it may,
+/// as long as the slice has budget left. Zero outside a slice.
+pub static mut slice_start: u32 = 0;
+pub static mut slice_bound: u32 = 0;
+
 #[no_mangle]
 pub unsafe fn run_slice(max_instructions: u32) -> u32 {
     let outer_bound = *jit_loop_counter;
     let start = *instruction_counter;
+    slice_start = start;
+    slice_bound = max_instructions;
 
     loop {
         let retired = (*instruction_counter).wrapping_sub(start);
@@ -3536,6 +3547,7 @@ pub unsafe fn run_slice(max_instructions: u32) -> u32 {
     }
 
     *jit_loop_counter = outer_bound;
+    slice_bound = 0;
     (*instruction_counter).wrapping_sub(start)
 }
 

@@ -331,6 +331,9 @@ CPU.prototype.create_jit_imports = function()
     const jit_imports = Object.create(null);
 
     jit_imports["m"] = this.wm.exports["memory"];
+    // The table generated modules are placed in: a module that leaves for
+    // another by a tail call names its slot in this.
+    jit_imports["__indirect_function_table"] = this.wm.wasm_table;
 
     for(const name of Object.keys(this.wm.exports))
     {
