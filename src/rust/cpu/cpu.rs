@@ -2549,6 +2549,26 @@ pub unsafe fn trigger_pagefault(addr: i32, present: bool, write: bool, user: boo
 }
 
 pub fn tlb_set_has_code(physical_page: Page, has_code: bool) {
+    // Without paging a physical page is mapped by the virtual page of the same
+    // number and by nothing else, so there is one entry to touch and no reason
+    // to walk them all: a program whose data shares a page with code lost and
+    // regained that page's hotness thousands of times a second, and the walk
+    // was a measured share of everything the machine did.
+    if unsafe { *cr } & CR0_PG == 0 {
+        let page = physical_page.to_u32() as i32;
+        let entry = unsafe { tlb_data[page as usize] };
+        if 0 != entry {
+            unsafe {
+                tlb_data[page as usize] =
+                    if has_code { entry | TLB_HAS_CODE } else { entry & !TLB_HAS_CODE }
+            }
+            if !has_code {
+                clear_tlb_code(page);
+            }
+        }
+        check_tlb_invariants();
+        return;
+    }
     for i in 0..unsafe { valid_tlb_entries_count } {
         let page = unsafe { valid_tlb_entries[i as usize] };
         let entry = unsafe { tlb_data[page as usize] };
