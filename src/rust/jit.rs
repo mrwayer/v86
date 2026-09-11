@@ -1919,6 +1919,35 @@ fn jit_generate_module(
                         }
                     }
                 }
+                else if unsafe { JIT_USE_LOOP_SAFETY } {
+                    // A loop with several entries is dispatched by index at its
+                    // head, and it was the one structure whose back edges never
+                    // met the bound: a spin on a flag compiled this way ran until
+                    // it left on its own, whatever the slice had asked for. The
+                    // exit has to name the block the jump was headed for, so the
+                    // dispatcher's index is turned back into that block's
+                    // address before leaving.
+                    profiler::stat_increment(stat::COMPILE_WITH_LOOP_SAFETY);
+                    codegen::gen_profiler_stat_increment(ctx.builder, stat::LOOP_SAFETY);
+                    ctx.builder.get_local(&ctx.instruction_counter);
+                    ctx.builder.load_fixed_i32(global_pointers::jit_loop_counter as u32);
+                    ctx.builder.geu_i32();
+                    ctx.builder.if_void();
+                    for &addr in entries.iter() {
+                        let index = *index_for_addr.get(&addr).unwrap();
+                        ctx.builder.get_local(target_block);
+                        ctx.builder.const_i32(index.into());
+                        ctx.builder.eq_i32();
+                        ctx.builder.if_void();
+                        codegen::gen_set_eip_low_bits(ctx.builder, addr as i32 & 0xFFF);
+                        if cfg!(feature = "profiler") {
+                            codegen::gen_debug_track_jit_exit(ctx.builder, addr);
+                        }
+                        ctx.builder.block_end();
+                    }
+                    ctx.builder.br(exit_label);
+                    ctx.builder.block_end();
+                }
 
                 let mut olds = HashMap::new();
                 for &target in entries.iter() {
