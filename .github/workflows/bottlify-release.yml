@@ -40,6 +40,15 @@ jobs:
         run: |
           mkdir -p out
           cp build/libv86.mjs build/libv86.js build/v86.wasm out/
+
+      # A second emulator that counts what it does: retired instructions by
+      # opcode, exits from generated code by cause, every slow path taken. Same
+      # sources, same module interface, so the launcher can load either; a
+      # measurement wants this one, a player wants the other.
+      - name: Build with the profiler
+        run: |
+          make with-profiler
+          cp build/v86.wasm out/v86-profiler.wasm
           cp bios/seabios.bin bios/vgabios.bin out/
           cd out
           sha256sum * | tee SHA256SUMS
