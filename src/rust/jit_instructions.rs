@@ -4448,6 +4448,31 @@ pub fn instr32_0F8F_jit(_ctx: &mut JitContext, _imm: u32) {}
 
 pub fn instr_90_jit(_ctx: &mut JitContext) {}
 
+pub fn instr_9B_jit(ctx: &mut JitContext) {
+    // fwait raises #NM when both MP and TS are set and otherwise has nothing
+    // to wait for. Compiled rather than left to end the block: a compiler
+    // puts one before every fnstsw, so as a block boundary it cost an exit
+    // from generated code and an entry back per status-word read.
+    let cr0_offset = global_pointers::get_creg_offset(0);
+    let both = crate::cpu::cpu::CR0_MP | crate::cpu::cpu::CR0_TS;
+    ctx.builder.load_fixed_u8(cr0_offset);
+    ctx.builder.const_i32(both);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(both);
+    ctx.builder.eq_i32();
+    ctx.builder.if_void();
+    {
+        codegen::gen_fn1_const(
+            ctx.builder,
+            "trigger_nm_jit",
+            ctx.start_of_current_instruction & 0xFFF,
+        );
+        codegen::gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+        ctx.builder.br(ctx.exit_with_fault_label);
+    }
+    ctx.builder.block_end();
+}
+
 fn gen_xchg_reg16(ctx: &mut JitContext, r: u32) {
     codegen::gen_get_reg16(ctx, r);
     let tmp = ctx.builder.set_new_local();
