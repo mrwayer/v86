@@ -999,15 +999,20 @@ fn gen_add32(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &Lo
         is_inc: false,
     };
 
-    codegen::gen_set_last_op1(ctx.builder, &dest_operand);
+    // Flags nobody reads are not recorded: the operation is all there is.
+    if !ctx.flags_dead {
+        codegen::gen_set_last_op1(ctx.builder, &dest_operand);
+    }
 
     ctx.builder.get_local(&dest_operand);
     source_operand.gen_get(ctx.builder);
     ctx.builder.add_i32();
     ctx.builder.set_local(dest_operand);
 
-    codegen::gen_set_last_result(ctx.builder, &dest_operand);
-    codegen::gen_set_last_op_size_and_flags_changed(ctx.builder, OPSIZE_32, FLAGS_ALL);
+    if !ctx.flags_dead {
+        codegen::gen_set_last_result(ctx.builder, &dest_operand);
+        codegen::gen_set_last_op_size_and_flags_changed(ctx.builder, OPSIZE_32, FLAGS_ALL);
+    }
 }
 
 fn gen_sub8(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &LocalOrImmediate) {
@@ -1055,15 +1060,19 @@ fn gen_sub32(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &Lo
         is_dec: false,
     };
 
-    codegen::gen_set_last_op1(ctx.builder, &dest_operand);
+    if !ctx.flags_dead {
+        codegen::gen_set_last_op1(ctx.builder, &dest_operand);
+    }
 
     ctx.builder.get_local(&dest_operand);
     source_operand.gen_get(ctx.builder);
     ctx.builder.sub_i32();
     ctx.builder.set_local(dest_operand);
 
-    codegen::gen_set_last_result(ctx.builder, &dest_operand);
-    codegen::gen_set_last_op_size_and_flags_changed(ctx.builder, OPSIZE_32, FLAGS_ALL | FLAG_SUB);
+    if !ctx.flags_dead {
+        codegen::gen_set_last_result(ctx.builder, &dest_operand);
+        codegen::gen_set_last_op_size_and_flags_changed(ctx.builder, OPSIZE_32, FLAGS_ALL | FLAG_SUB);
+    }
 }
 
 fn gen_cmp(
@@ -1077,6 +1086,11 @@ fn gen_cmp(
         source: source_operand.to_instruction_operand(ctx),
         opsize: size,
     };
+
+    // A compare whose flags nobody reads does nothing at all.
+    if ctx.flags_dead {
+        return;
+    }
 
     ctx.builder.const_i32(global_pointers::last_result as i32);
     if source_operand.is_zero() {
@@ -1345,6 +1359,9 @@ fn gen_and32(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &Lo
     ctx.builder.and_i32();
     ctx.builder.set_local(dest_operand);
 
+    if ctx.flags_dead {
+        return;
+    }
     codegen::gen_set_last_result(ctx.builder, &dest_operand);
     codegen::gen_set_last_op_size_and_flags_changed(
         ctx.builder,
@@ -1370,6 +1387,10 @@ fn gen_test(
             InstructionOperandDest::Other
         },
     };
+
+    if ctx.flags_dead {
+        return;
+    }
 
     ctx.builder.const_i32(global_pointers::last_result as i32);
     if is_self_test {
@@ -1432,6 +1453,9 @@ fn gen_or32(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &Loc
     ctx.builder.or_i32();
     ctx.builder.set_local(dest_operand);
 
+    if ctx.flags_dead {
+        return;
+    }
     codegen::gen_set_last_result(ctx.builder, &dest_operand);
     codegen::gen_set_last_op_size_and_flags_changed(
         ctx.builder,
@@ -1483,6 +1507,9 @@ fn gen_xor32(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &Lo
         ctx.builder.set_local(dest_operand);
     }
 
+    if ctx.flags_dead {
+        return;
+    }
     codegen::gen_set_last_result(ctx.builder, &dest_operand);
     codegen::gen_set_last_op_size_and_flags_changed(
         ctx.builder,
@@ -2362,6 +2389,21 @@ pub fn instr32_3D_jit(ctx: &mut JitContext, imm32: u32) {
 }
 
 fn gen_inc(ctx: &mut JitContext, dest_operand: &WasmLocal, size: i32) {
+    // With its flags dead, an increment is the addition alone -- and is
+    // spared reading the carry it would otherwise have to keep.
+    if ctx.flags_dead {
+        ctx.builder.get_local(dest_operand);
+        ctx.builder.const_i32(1);
+        ctx.builder.add_i32();
+        if size == OPSIZE_16 {
+            codegen::gen_set_reg16_local(ctx.builder, dest_operand);
+        }
+        else {
+            ctx.builder.set_local(dest_operand);
+        }
+        ctx.current_instruction = Instruction::Other;
+        return;
+    }
     ctx.builder.const_i32(global_pointers::flags as i32);
     codegen::gen_get_flags(ctx.builder);
     ctx.builder.const_i32(!1);
@@ -2412,6 +2454,19 @@ fn gen_inc32(ctx: &mut JitContext, dest_operand: &WasmLocal) {
 }
 
 fn gen_dec(ctx: &mut JitContext, dest_operand: &WasmLocal, size: i32) {
+    if ctx.flags_dead {
+        ctx.builder.get_local(dest_operand);
+        ctx.builder.const_i32(1);
+        ctx.builder.sub_i32();
+        if size == OPSIZE_16 {
+            codegen::gen_set_reg16_local(ctx.builder, dest_operand);
+        }
+        else {
+            ctx.builder.set_local(dest_operand);
+        }
+        ctx.current_instruction = Instruction::Other;
+        return;
+    }
     ctx.builder.const_i32(global_pointers::flags as i32);
     codegen::gen_get_flags(ctx.builder);
     ctx.builder.const_i32(!1);

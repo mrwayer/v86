@@ -85,6 +85,11 @@ fn block_chaining_enabled() -> bool { unsafe { JIT_BLOCK_CHAINING } }
 pub static mut JIT_FPU_INLINE: bool = true;
 pub fn fpu_inline_enabled() -> bool { unsafe { JIT_FPU_INLINE } }
 
+/// Whether an arithmetic instruction whose flags no one reads is compiled
+/// without recording them. Configuration index 8.
+pub static mut JIT_DEAD_FLAGS: bool = true;
+pub fn dead_flags_enabled() -> bool { unsafe { JIT_DEAD_FLAGS } }
+
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 
 // How many instructions a page runs interpreted before it is compiled. A
@@ -365,6 +370,10 @@ pub struct JitContext<'a> {
     pub previous_instruction: Instruction,
     pub instruction_counter: WasmLocal,
     pub wasm_table_index: WasmTableIndex,
+    /// Whether the flags the instruction being compiled would leave are
+    /// overwritten before anything reads them, so that it need not record
+    /// them. Decided per instruction by `flags_dead_after`.
+    pub flags_dead: bool,
 }
 impl<'a> JitContext<'a> {
     pub fn reg(&self, i: u32) -> WasmLocal {
@@ -382,6 +391,132 @@ pub const JIT_INSTR_BLOCK_BOUNDARY_FLAG: u32 = 1 << 0;
 
 pub fn is_near_end_of_page(address: u32) -> bool {
     address & 0xFFF >= 0x1000 - MAX_INSTRUCTION_LENGTH
+}
+
+/// What an instruction does to the arithmetic flags, as far as deciding
+/// whether the flags before it are still needed. Anything not known to
+/// overwrite all six or to leave them all alone counts as reading them.
+#[derive(PartialEq)]
+enum FlagUse {
+    /// Writes all six without reading any: the flags before it are dead.
+    Overwrites,
+    /// Neither reads nor writes them.
+    Leaves,
+    /// May read them, or writes only some: the flags before it are live.
+    Reads,
+}
+
+/// How far the walk looks past an instruction for the one that overwrites
+/// its flags. Bounded so that compiling stays linear in the block; a run of
+/// moves between two arithmetic instructions is rarely longer.
+const DEAD_FLAGS_WALK: u32 = 8;
+
+fn code_byte(addr: u32) -> u8 { memory::read8(addr) as u8 }
+
+fn flag_use(addr: u32) -> FlagUse {
+    let mut at = addr;
+    loop {
+        match code_byte(at) {
+            0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => at += 1,
+            _ => break,
+        }
+    }
+    let opcode = code_byte(at);
+    let modrm = code_byte(at + 1);
+    let reg = (modrm >> 3) & 7;
+    match opcode {
+        // The eight arithmetic instructions, and test, in every form: their
+        // result defines every flag.
+        0x00..=0x05 | 0x08..=0x0D | 0x20..=0x25 | 0x28..=0x2D | 0x30..=0x35 | 0x38..=0x3D
+        | 0x84 | 0x85 | 0xA8 | 0xA9 => FlagUse::Overwrites,
+        // Group 1 with an immediate: adc and sbb read the carry, the rest
+        // define everything.
+        0x80 | 0x81 | 0x83 => {
+            if reg == 2 || reg == 3 {
+                FlagUse::Reads
+            }
+            else {
+                FlagUse::Overwrites
+            }
+        },
+        // Group 3: test and neg define every flag; not leaves them; the
+        // multiplies and divides leave some undefined, so are not relied on.
+        0xF6 | 0xF7 => match reg {
+            0 | 1 | 3 => FlagUse::Overwrites,
+            2 => FlagUse::Leaves,
+            _ => FlagUse::Reads,
+        },
+        // Moves of every kind, exchanges, pushes and pops, lea, nop.
+        0x50..=0x5F | 0x68 | 0x6A | 0x86..=0x8B | 0x8D | 0x8F | 0x90..=0x97 | 0xA0..=0xA3
+        | 0xB0..=0xBF | 0xC6 | 0xC7 | 0xC9 => FlagUse::Leaves,
+        // String moves, stores and loads; the compares and scans write flags.
+        0xA4 | 0xA5 | 0xAA..=0xAD => FlagUse::Leaves,
+        // x87 leaves the integer flags alone, except the compares that set
+        // them directly (fcomi and its relatives, DB and DF with E8..F7).
+        0xD8..=0xDF => {
+            if (opcode == 0xDB || opcode == 0xDF) && (0xE8..=0xF7).contains(&modrm) {
+                FlagUse::Reads
+            }
+            else {
+                FlagUse::Leaves
+            }
+        },
+        0x0F => match modrm {
+            // movzx, movsx, the SSE and MMX moves, the long nop.
+            0xB6 | 0xB7 | 0xBE | 0xBF | 0x10 | 0x11 | 0x28 | 0x29 | 0x6E | 0x6F | 0x7E | 0x7F
+            | 0xD6 | 0x1F => FlagUse::Leaves,
+            _ => FlagUse::Reads,
+        },
+        _ => FlagUse::Reads,
+    }
+}
+
+/// Whether an instruction writes flags at all, so that there is something
+/// to leave out: the overwriters, and inc and dec, which keep the carry.
+fn writes_flags(addr: u32) -> bool {
+    if flag_use(addr) == FlagUse::Overwrites {
+        return true;
+    }
+    let mut at = addr;
+    while matches!(code_byte(at), 0x66 | 0x67 | 0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65) {
+        at += 1;
+    }
+    let opcode = code_byte(at);
+    (0x40..=0x4F).contains(&opcode)
+        || ((opcode == 0xFE || opcode == 0xFF) && ((code_byte(at + 1) >> 3) & 7) <= 1)
+}
+
+/// Where the instruction at `addr` ends, by the analyser's decoding.
+fn instruction_end(cpu: &CpuContext, addr: u32) -> u32 {
+    let mut step = cpu.clone();
+    step.eip = addr;
+    analysis::analyze_step(&mut step);
+    step.eip
+}
+
+/// Whether the flags the instruction at `cpu.eip` writes are overwritten
+/// before anything reads them, within its block. The instructions that
+/// follow are decoded until one overwrites every flag (dead), one may read
+/// or partially write them (live), or the block ends (live: the successor
+/// is not looked into, and a fault frame between would hold the flags of
+/// an earlier instruction, which a program's own exception filter could
+/// see -- the one observer this trades away).
+fn flags_dead_after(cpu: &CpuContext, block_end: u32) -> bool {
+    if !writes_flags(cpu.eip) {
+        return false;
+    }
+    let mut addr = instruction_end(cpu, cpu.eip);
+    for _ in 0..DEAD_FLAGS_WALK {
+        if addr >= block_end {
+            return false;
+        }
+        match flag_use(addr) {
+            FlagUse::Overwrites => return true,
+            FlagUse::Reads => return false,
+            FlagUse::Leaves => addr = instruction_end(cpu, addr),
+        }
+    }
+    false
 }
 
 pub fn jit_find_cache_entry(phys_address: u32, state_flags: CachedStateFlags) -> CachedCode {
@@ -1377,6 +1512,7 @@ fn jit_generate_module(
         previous_instruction: Instruction::Other,
         instruction_counter,
         wasm_table_index,
+        flags_dead: false,
     };
 
     let entry_blocks = {
@@ -2269,6 +2405,10 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
 
         ctx.start_of_current_instruction = ctx.cpu.eip;
         let start_eip = ctx.cpu.eip;
+        ctx.flags_dead = dead_flags_enabled() && flags_dead_after(ctx.cpu, stop_addr);
+        if ctx.flags_dead {
+            unsafe { cpu::note_stat(11, 1) };
+        }
         let mut instruction_flags = 0;
         jit_instructions::jit_instruction(ctx, &mut instruction_flags);
         let end_eip = ctx.cpu.eip;
@@ -2676,6 +2816,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         5 => crate::softfloat::FAST_F80 = value != 0,
         6 => JIT_BLOCK_CHAINING = value != 0,
         7 => JIT_FPU_INLINE = value != 0,
+        8 => JIT_DEAD_FLAGS = value != 0,
         _ => dbg_assert!(false),
     }
 }

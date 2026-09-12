@@ -309,7 +309,7 @@ pub const LOOP_COUNTER: i32 = 100_003;
 /// 8: exits from generated code that went straight into another module
 /// 9: exits that looked for one and found none compiled
 /// 10: exits that would have chained but the slice's budget was spent
-pub const STAT_COUNT: usize = 11;
+pub const STAT_COUNT: usize = 12;
 pub static mut STATS: [u64; STAT_COUNT] = [0; STAT_COUNT];
 
 /// The pages written most while holding code, so a report can name them:
