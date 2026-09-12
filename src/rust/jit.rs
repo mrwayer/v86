@@ -86,8 +86,9 @@ pub static mut JIT_FPU_INLINE: bool = true;
 pub fn fpu_inline_enabled() -> bool { unsafe { JIT_FPU_INLINE } }
 
 /// Whether an arithmetic instruction whose flags no one reads is compiled
-/// without recording them. Configuration index 8.
-pub static mut JIT_DEAD_FLAGS: bool = true;
+/// without recording them. Configuration index 8; off until a measurement
+/// shows a gain, since on a title's menu and match it showed none.
+pub static mut JIT_DEAD_FLAGS: bool = false;
 pub fn dead_flags_enabled() -> bool { unsafe { JIT_DEAD_FLAGS } }
 
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
