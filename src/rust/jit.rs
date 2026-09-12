@@ -155,6 +155,29 @@ struct PageInfo {
     hidden_wasm_table_indices: Vec<WasmTableIndex>,
     entry_points: Vec<(u16, u16)>,
     state_flags: CachedStateFlags,
+    code_bytes: CodeBytes,
+}
+
+/// Which bytes of a page compiled instructions occupy, one bit each, so a
+/// write into the page throws its code away only when it lands on them: a
+/// page that mixes data with code is written for as long as the program
+/// runs, and losing the code to every write kept the page interpreted.
+struct CodeBytes([u64; 64]);
+
+impl CodeBytes {
+    const NONE: CodeBytes = CodeBytes([0; 64]);
+
+    fn mark(&mut self, offset: u32) { self.0[(offset >> 6) as usize] |= 1 << (offset & 63) }
+
+    fn hit(&self, offset: u32, len: u32) -> bool {
+        (offset..offset + len).any(|i| self.0[(i >> 6) as usize] >> (i & 63) & 1 != 0)
+    }
+
+    fn union(&mut self, other: &CodeBytes) {
+        for (mine, theirs) in self.0.iter_mut().zip(other.0.iter()) {
+            *mine |= theirs;
+        }
+    }
 }
 
 enum CompilingPageState {
@@ -561,6 +584,7 @@ pub fn jit_find_cache_entry(phys_address: u32, state_flags: CachedStateFlags) ->
             state_flags: s,
             entry_points,
             hidden_wasm_table_indices: _,
+            code_bytes: _,
         }) => {
             if *s == state_flags {
                 let page_offset = phys_address as u16 & 0xFFF;
@@ -1408,6 +1432,7 @@ fn jit_analyze_and_generate(
             state_flags,
             entry_points: Vec::new(),
             hidden_wasm_table_indices: Vec::new(),
+            code_bytes: CodeBytes::NONE,
         });
         ctx.entry_points
             .entry(p)
@@ -1416,6 +1441,13 @@ fn jit_analyze_and_generate(
     for &(addr, state) in &entries {
         let code = page_info.get_mut(&Page::page_of(addr)).unwrap();
         code.entry_points.push((addr as u16 & 0xFFF, state));
+    }
+    for b in basic_block_by_addr.values() {
+        for addr in b.addr..b.end_addr {
+            if let Some(code) = page_info.get_mut(&Page::page_of(addr)) {
+                code.code_bytes.mark(addr & 0xFFF);
+            }
+        }
     }
 
     profiler::stat_increment_by(
@@ -1509,6 +1541,7 @@ pub fn codegen_finalize_finished(
 
     for (page, mut info) in pages {
         if let Some(old_entry) = ctx.pages.remove(&page) {
+            info.code_bytes.union(&old_entry.code_bytes);
             info.hidden_wasm_table_indices
                 .extend(old_entry.hidden_wasm_table_indices);
             info.hidden_wasm_table_indices
@@ -1545,6 +1578,7 @@ pub fn update_tlb_code(virt_page: Page, phys_page: Page) {
             entry_points,
             state_flags,
             hidden_wasm_table_indices: _,
+            code_bytes: _,
         }) => set_tlb_code(virt_page, *wasm_table_index, entry_points, *state_flags),
         None => cpu::clear_tlb_code(virt_page.to_u32() as i32),
     };
@@ -2710,6 +2744,7 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
         hidden_wasm_table_indices,
         state_flags: _,
         entry_points: _,
+        code_bytes: _,
     }) = ctx.pages.remove(&page)
     {
         profiler::stat_increment(stat::INVALIDATE_PAGE_HAD_CODE);
@@ -2722,7 +2757,8 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
         }
 
         fn free(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
-            ctx.pages.retain(|_, info| {
+            let entry_points = &ctx.entry_points;
+            ctx.pages.retain(|page, info| {
                 if info.wasm_table_index != wasm_table_index {
                     return true;
                 }
@@ -2732,7 +2768,12 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
                         info.entry_points.clear();
                         true
                     },
-                    None => false,
+                    None => {
+                        if !entry_points.contains_key(page) {
+                            unsafe { cpu::page_has_code[page.to_u32() as usize] = 0 };
+                        }
+                        false
+                    },
                 }
             });
 
@@ -2808,6 +2849,37 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
     }
 }
 
+/// Registers a write of `len` bytes into `page` at `offset`, both within
+/// the page: code whose instructions the bytes belong to is thrown away, as
+/// a module being compiled from them is, and says so. Code elsewhere in the
+/// page is kept, and so are the page's entry points and its hotness, since
+/// a compile reads the bytes as they are then.
+fn jit_write_page_ctx(ctx: &mut JitState, page: Page, offset: u32, len: u32) -> bool {
+    dbg_assert!(len > 0 && offset + len <= 0x1000);
+    let compiling = match &ctx.compiling {
+        Some((_, CompilingPageState::Compiling { pages })) => pages.get(&page),
+        _ => None,
+    };
+    let hit = |info: Option<&PageInfo>| info.map_or(false, |i| i.code_bytes.hit(offset, len));
+    if hit(ctx.pages.get(&page)) || hit(compiling) {
+        jit_dirty_page_ctx(ctx, page);
+        return true;
+    }
+    if ctx.entry_points.contains_key(&page) {
+        unsafe {
+            cpu::note_stat(5, 1);
+            cpu::note_stat(13, 1);
+            cpu::note_dirty_page(page.to_u32());
+        }
+    }
+    false
+}
+
+pub fn jit_write_page(page: Page, offset: u32, len: u32) -> bool {
+    jit_write_page_ctx(&mut get_jit_state(), page, offset, len)
+}
+
+/// Registers a write of the bytes from start_addr up to end_addr.
 #[no_mangle]
 pub fn jit_dirty_cache(start_addr: u32, end_addr: u32) {
     dbg_assert!(start_addr < end_addr);
@@ -2815,30 +2887,26 @@ pub fn jit_dirty_cache(start_addr: u32, end_addr: u32) {
     let start_page = Page::page_of(start_addr);
     let end_page = Page::page_of(end_addr - 1);
 
+    let mut ctx = get_jit_state();
     for page in start_page.to_u32()..end_page.to_u32() + 1 {
-        jit_dirty_page_ctx(&mut get_jit_state(), Page::page_of(page << 12));
+        let page_start = page << 12;
+        let offset = start_addr.saturating_sub(page_start);
+        let end = u32::min(end_addr - page_start, 0x1000);
+        jit_write_page_ctx(&mut ctx, Page::page_of(page_start), offset, end - offset);
     }
 }
 
 #[no_mangle]
 pub fn jit_dirty_page(page: Page) { jit_dirty_page_ctx(&mut get_jit_state(), page) }
 
-/// dirty pages in the range of start_addr and end_addr, which must span at most two pages
+/// Registers a write of the bytes from start_addr up to end_addr, which
+/// span at most two pages
 pub fn jit_dirty_cache_small(start_addr: u32, end_addr: u32) {
     dbg_assert!(start_addr < end_addr);
-
-    let start_page = Page::page_of(start_addr);
-    let end_page = Page::page_of(end_addr - 1);
-
-    let mut ctx = get_jit_state();
-    jit_dirty_page_ctx(&mut ctx, start_page);
-
-    // Note: This can't happen when paging is enabled, as writes across
-    //       boundaries are split up on two pages
-    if start_page != end_page {
-        dbg_assert!(start_page.to_u32() + 1 == end_page.to_u32());
-        jit_dirty_page_ctx(&mut ctx, end_page);
-    }
+    // Note: A write across two pages can't happen when paging is enabled,
+    //       as writes across boundaries are split up on two pages
+    dbg_assert!(Page::page_of(end_addr - 1).to_u32() <= Page::page_of(start_addr).to_u32() + 1);
+    jit_dirty_cache(start_addr, end_addr);
 }
 
 #[no_mangle]

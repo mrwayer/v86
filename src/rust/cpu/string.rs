@@ -20,7 +20,6 @@ use crate::cpu::cpu::{
 use crate::cpu::global_pointers::{flags, instruction_pointer, previous_ip};
 use crate::cpu::memory;
 use crate::jit;
-use crate::page::Page;
 
 fn count_until_end_of_page(direction: i32, size: i32, addr: u32) -> u32 {
     (if direction == 1 {
@@ -245,7 +244,14 @@ unsafe fn string_instruction(
         dbg_assert!(count_until_end_of_page > 0);
 
         if !skip_dirty_page {
-            jit::jit_dirty_page(Page::page_of(phys_dst));
+            let run = count_until_end_of_page * size_bytes as u32;
+            let end = if direction == 1 {
+                phys_dst + run
+            }
+            else {
+                phys_dst + size_bytes as u32
+            };
+            jit::jit_dirty_cache_small(end - run, end);
         }
 
         let mut rep_cmp_finished = false;

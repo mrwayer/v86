@@ -311,7 +311,9 @@ pub const LOOP_COUNTER: i32 = 100_003;
 /// 10: exits that would have chained but the slice's budget was spent
 /// 11: instructions compiled without recording their flags
 /// 12: writes from generated code that took the slow path
-pub const STAT_COUNT: usize = 13;
+/// 13: of the writes into a page holding code, ones outside any compiled
+///     instruction's bytes, which kept the code and the page's hotness
+pub const STAT_COUNT: usize = 14;
 pub static mut STATS: [u64; STAT_COUNT] = [0; STAT_COUNT];
 
 /// The pages written most while holding code, so a report can name them:
@@ -2113,7 +2115,14 @@ pub unsafe fn translate_address_read_jit(address: i32) -> OrPageFault<u32> {
 pub unsafe fn translate_address_write(address: i32) -> OrPageFault<u32> {
     translate_address(address, true, *cpl == 3, false, true)
 }
-pub unsafe fn translate_address_write_jit(address: i32, wasm_table_index: u16) -> OrPageFault<u32> {
+/// Translates the address for a write of `len` bytes from generated code,
+/// which stay within the page; code the bytes belong to is thrown away, and
+/// a module writing itself is asked to leave.
+pub unsafe fn translate_address_write_jit(
+    address: i32,
+    len: u32,
+    wasm_table_index: u16,
+) -> OrPageFault<u32> {
     let mut entry = tlb_data[(address as u32 >> 12) as usize];
     let user = *cpl == 3;
     if entry & (TLB_VALID | if user { TLB_NO_USER } else { 0 } | TLB_READONLY) != TLB_VALID {
@@ -2126,8 +2135,7 @@ pub unsafe fn translate_address_write_jit(address: i32, wasm_table_index: u16) -
         return Ok(phys_addr);
     }
     let is_smc = jit::jit_page_has_wasm_table_index(page, wasm_table_index);
-    jit::jit_dirty_page(page);
-    if !is_smc {
+    if !jit::jit_write_page(page, phys_addr & 0xFFF, len) || !is_smc {
         return Ok(phys_addr);
     }
     dbg_log!(
@@ -3799,6 +3807,13 @@ pub fn report_safe_read_write_jit_slow(address: u32, entry: i32) {
     }
 }
 
+/// How many of `len` bytes written at `addr` fall in its page, and how
+/// many in the next.
+fn split_at_page_end(addr: i32, len: u32) -> (u32, u32) {
+    let in_page = u32::min(len, 0x1000 - (addr as u32 & 0xFFF));
+    (in_page, len - in_page)
+}
+
 #[repr(align(0x1000))]
 struct ScratchBuffer([u8; 0x1000 * 2]);
 static mut jit_paging_scratch_buffer: ScratchBuffer = ScratchBuffer([0; 2 * 0x1000]);
@@ -3815,8 +3830,9 @@ pub unsafe fn safe_read_slow_jit(
     dbg_assert!(u32::from(wasm_table_index) < jit::WASM_TABLE_SIZE);
 
     let crosses_page = (addr & 0xFFF) + bitsize / 8 > 0x1000;
+    let (low_len, high_len) = split_at_page_end(addr, bitsize as u32 / 8);
     let addr_low = match if is_write {
-        translate_address_write_jit(addr, wasm_table_index)
+        translate_address_write_jit(addr, low_len, wasm_table_index)
     }
     else {
         translate_address_read_jit(addr)
@@ -3830,7 +3846,7 @@ pub unsafe fn safe_read_slow_jit(
     if crosses_page {
         let boundary_addr = (addr | 0xFFF) + 1;
         let addr_high = match if is_write {
-            translate_address_write_jit(boundary_addr, wasm_table_index)
+            translate_address_write_jit(boundary_addr, high_len, wasm_table_index)
         }
         else {
             translate_address_read_jit(boundary_addr)
@@ -3969,7 +3985,8 @@ pub unsafe fn safe_write_slow_jit(
     note_stat(12, 1);
 
     let crosses_page = (addr & 0xFFF) + bitsize / 8 > 0x1000;
-    let addr_low = match translate_address_write_jit(addr, wasm_table_index) {
+    let (low_len, high_len) = split_at_page_end(addr, bitsize as u32 / 8);
+    let addr_low = match translate_address_write_jit(addr, low_len, wasm_table_index) {
         Err(()) => {
             *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
             return 1;
@@ -3977,7 +3994,9 @@ pub unsafe fn safe_write_slow_jit(
         Ok(x) => x,
     };
     if crosses_page {
-        let addr_high = match translate_address_write_jit((addr | 0xFFF) + 1, wasm_table_index) {
+        let boundary_addr = (addr | 0xFFF) + 1;
+        let addr_high =
+            match translate_address_write_jit(boundary_addr, high_len, wasm_table_index) {
             Err(()) => {
                 *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
                 return 1;
@@ -4074,9 +4093,11 @@ pub unsafe fn writable_or_pagefault_jit(
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
     dbg_assert!(u32::from(wasm_table_index) < jit::WASM_TABLE_SIZE);
     let crosses_page = (addr & 0xFFF) + size > 0x1000;
-    if translate_address_write_jit(addr, wasm_table_index).is_err()
+    let (low_len, high_len) = split_at_page_end(addr, size as u32);
+    if translate_address_write_jit(addr, low_len, wasm_table_index).is_err()
         || crosses_page
-            && translate_address_write_jit((addr | 0xFFF) + 1, wasm_table_index).is_err()
+            && translate_address_write_jit((addr | 0xFFF) + 1, high_len, wasm_table_index)
+                .is_err()
     {
         *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
         return 1;
@@ -4091,7 +4112,7 @@ pub unsafe fn safe_write8(addr: i32, value: i32) -> OrPageFault<()> {
     }
     else {
         if !can_skip_dirty_page {
-            jit::jit_dirty_page(Page::page_of(phys_addr));
+            jit::jit_dirty_cache_small(phys_addr, phys_addr + 1);
         }
         else {
             dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4112,7 +4133,7 @@ pub unsafe fn safe_write16(addr: i32, value: i32) -> OrPageFault<()> {
     }
     else {
         if !can_skip_dirty_page {
-            jit::jit_dirty_page(Page::page_of(phys_addr));
+            jit::jit_dirty_cache_small(phys_addr, phys_addr + 2);
         }
         else {
             dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4136,7 +4157,7 @@ pub unsafe fn safe_write32(addr: i32, value: i32) -> OrPageFault<()> {
     }
     else {
         if !can_skip_dirty_page {
-            jit::jit_dirty_page(Page::page_of(phys_addr));
+            jit::jit_dirty_cache_small(phys_addr, phys_addr + 4);
         }
         else {
             dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4159,7 +4180,7 @@ pub unsafe fn safe_write64(addr: i32, value: u64) -> OrPageFault<()> {
         }
         else {
             if !can_skip_dirty_page {
-                jit::jit_dirty_page(Page::page_of(phys_addr));
+                jit::jit_dirty_cache_small(phys_addr, phys_addr + 8);
             }
             else {
                 dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4183,7 +4204,7 @@ pub unsafe fn safe_write128(addr: i32, value: reg128) -> OrPageFault<()> {
         }
         else {
             if !can_skip_dirty_page {
-                jit::jit_dirty_page(Page::page_of(phys_addr));
+                jit::jit_dirty_cache_small(phys_addr, phys_addr + 16);
             }
             else {
                 dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4206,7 +4227,7 @@ pub unsafe fn safe_read_write8(addr: i32, instruction: &dyn Fn(i32) -> i32) {
     }
     else {
         if !can_skip_dirty_page {
-            jit::jit_dirty_page(Page::page_of(phys_addr));
+            jit::jit_dirty_cache_small(phys_addr, phys_addr + 1);
         }
         else {
             dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4233,7 +4254,7 @@ pub unsafe fn safe_read_write16(addr: i32, instruction: &dyn Fn(i32) -> i32) {
         }
         else {
             if !can_skip_dirty_page {
-                jit::jit_dirty_page(Page::page_of(phys_addr));
+                jit::jit_dirty_cache_small(phys_addr, phys_addr + 2);
             }
             else {
                 dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4261,7 +4282,7 @@ pub unsafe fn safe_read_write32(addr: i32, instruction: &dyn Fn(i32) -> i32) {
         }
         else {
             if !can_skip_dirty_page {
-                jit::jit_dirty_page(Page::page_of(phys_addr));
+                jit::jit_dirty_cache_small(phys_addr, phys_addr + 4);
             }
             else {
                 dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));

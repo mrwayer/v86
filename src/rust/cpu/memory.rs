@@ -191,7 +191,7 @@ pub unsafe fn write8(addr: u32, value: i32) {
         mmap_write8(addr, value & 0xFF);
     }
     else {
-        jit::jit_dirty_page(Page::page_of(addr));
+        jit::jit_dirty_cache_small(addr, addr + 1);
         write8_no_mmap_or_dirty_check(addr, value);
     };
 }
