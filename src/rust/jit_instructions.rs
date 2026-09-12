@@ -4926,17 +4926,16 @@ fn gen_string_ins(ctx: &mut JitContext, ins: String, size: u8, prefix: u8) {
         }
     }
 
-    let mut args = 0;
-    args += 1;
-    ctx.builder.const_i32(ctx.cpu.asize_32() as i32);
+    // The helper's arguments, pushed inside the loop below: a wasm loop
+    // starts with an empty operand stack.
+    let mut arguments = vec![ctx.cpu.asize_32() as i32];
 
     if ins == String::OUTS || ins == String::CMPS || ins == String::LODS || ins == String::MOVS {
         // TODO: check es/ds is null (only if rep && count!=0)
-        args += 1;
         let prefix = ctx.cpu.prefixes & PREFIX_MASK_SEGMENT;
         dbg_assert!(prefix != SEG_PREFIX_ZERO);
         let seg = if prefix != 0 { (prefix - 1) as u32 } else { regs::DS };
-        ctx.builder.const_i32(seg as i32);
+        arguments.push(seg as i32);
     }
 
     let name = format!(
@@ -4991,14 +4990,14 @@ fn gen_string_ins(ctx: &mut JitContext, ins: String, size: u8, prefix: u8) {
     let again = ctx.builder.loop_void();
     {
         codegen::gen_move_registers_from_locals_to_memory(ctx);
-        if args == 1 {
+        for &argument in arguments.iter() {
+            ctx.builder.const_i32(argument);
+        }
+        if arguments.len() == 1 {
             ctx.builder.call_fn1(&name)
         }
-        else if args == 2 {
-            ctx.builder.call_fn2(&name)
-        }
         else {
-            dbg_assert!(false);
+            ctx.builder.call_fn2(&name)
         }
         codegen::gen_move_registers_from_memory_to_locals(ctx);
 
