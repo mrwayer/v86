@@ -869,6 +869,19 @@ fn jit_find_basic_blocks(
                 // may not take -- is left to the interpreter: the block stops
                 // short of it, with eip on it.
                 let plain = analysis.ty == AnalysisType::Normal && has_next_instruction;
+                // A page reached by falling through may have no entry point
+                // of its own to have made it hot; the block that falls into
+                // it is its warmth, so it is taken into the module when there
+                // is room, as a jump's target page would be.
+                let next_page = Page::page_of(current_address);
+                if plain
+                    && !pages.contains(&next_page)
+                    && (pages.len() as u32) < max_pages
+                    && !page_blacklist.contains(&next_page)
+                    && !ctx.entry_points.contains_key(&next_page)
+                {
+                    pages.insert(next_page);
+                }
                 let continuation = if plain {
                     follow_jump(
                         current_virt_addr,
@@ -1253,8 +1266,10 @@ fn jit_analyze_and_generate(
     let mut pages = HashSet::new();
 
     for b in basic_blocks.iter() {
-        // Remove this assertion once page-crossing jit is enabled
-        dbg_assert!(Page::page_of(b.addr) == Page::page_of(b.end_addr));
+        // A block ends in the next page only where the pages are flat and
+        // its last instruction reaches across; that page has a block of its
+        // own then, the continuation, which puts it in the set.
+        dbg_assert!(Page::page_of(b.addr) == Page::page_of(b.end_addr) || pages_are_flat());
         pages.insert(Page::page_of(b.addr));
     }
 
