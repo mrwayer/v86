@@ -445,25 +445,25 @@ pub fn jit_find_cache_entry_in_page(
     return -1;
 }
 
-/// Where generated code leaving its module may go on to, packed as the
-/// target's table slot in the high half and its dispatcher state in the low,
-/// or -1 to return to the runtime instead.
+/// Where generated code leaving its block may go on to: the dispatcher
+/// state of the instruction pointer in the module it is in (a return into
+/// the routine that made the call), the target's table slot in the high half
+/// and its state in the low for another compiled module, or -1 to return to
+/// the runtime. One lookup answers all three, where an indirect exit used to
+/// look the page up once to see whether it could stay and once more to see
+/// where it could go.
 ///
 /// Measured on a title in a match, three exits from generated code in four
 /// were a `call` or a `ret` crossing a page, each a return to the runtime, a
 /// lookup, a table call and the registers spilled and reloaded around it.
-/// Refused once the slice's budget is spent, so that a chain never holds the
-/// machine past what the slice asked for; when it is taken, the loop bound
-/// the next module reads is what is left of the slice, as `run_slice` would
-/// have set it before entering that module itself.
+/// A chain is refused once the slice's budget is spent, so that it never
+/// holds the machine past what the slice asked for; `pending` is what the
+/// module has retired and not yet folded into the counter. When a chain is
+/// taken, the loop bound the next module reads is what is left of the slice,
+/// as `run_slice` would have set it before entering that module itself.
 #[no_mangle]
-pub unsafe fn jit_chain_target(state_flags: u32) -> i32 {
-    let bound = cpu::slice_bound;
-    let elapsed = (*global_pointers::instruction_counter).wrapping_sub(cpu::slice_start);
-    if bound == 0 || elapsed >= bound || *global_pointers::in_hlt {
-        cpu::note_stat(10, 1);
-        return -1;
-    }
+pub unsafe fn jit_chain_target(own_wasm_table_index: u32, state_flags: u32, pending: i32) -> i32 {
+    profiler::stat_increment(stat::INDIRECT_JUMP);
     let virt_address = *global_pointers::instruction_pointer as u32;
     let state_flags = CachedStateFlags::of_u32(state_flags);
     if let Some(c) = cpu::tlb_code[(virt_address >> 12) as usize] {
@@ -471,6 +471,17 @@ pub unsafe fn jit_chain_target(state_flags: u32) -> i32 {
         if state_flags == c.state_flags {
             let state = c.state_table[virt_address as usize & 0xFFF];
             if state != u16::MAX {
+                if c.wasm_table_index.to_u16() as u32 == own_wasm_table_index {
+                    return state as i32;
+                }
+                let bound = cpu::slice_bound;
+                let elapsed = (*global_pointers::instruction_counter)
+                    .wrapping_add(pending as u32)
+                    .wrapping_sub(cpu::slice_start);
+                if bound == 0 || elapsed >= bound || *global_pointers::in_hlt {
+                    cpu::note_stat(10, 1);
+                    return -1;
+                }
                 let left = bound - elapsed;
                 *global_pointers::jit_loop_counter =
                     left.min(cpu::LOOP_COUNTER as u32).max(1) as i32;
@@ -480,39 +491,54 @@ pub unsafe fn jit_chain_target(state_flags: u32) -> i32 {
             }
         }
     }
+    profiler::stat_increment(stat::INDIRECT_JUMP_NO_ENTRY);
     cpu::note_stat(9, 1);
     -1
 }
 
-/// Leaves the module: into whatever compiled module holds the instruction
-/// pointer when chaining is on and one does, and to the runtime otherwise.
-/// The registers are spilled and the instruction count folded first either
-/// way; the plain exit that follows a miss does both again, harmlessly.
+/// Leaves the block: back into this module's dispatcher when the instruction
+/// pointer is in it, into whatever other compiled module holds it when
+/// chaining is on, and to the runtime otherwise. The registers are spilled
+/// and the instruction count folded only on the way out to another module;
+/// the runtime exit does both itself.
 fn gen_chain_or_exit(
     ctx: &mut JitContext,
+    main_loop_label: Label,
     state_flags: CachedStateFlags,
     last_instruction_addr: u32,
 ) {
     if block_chaining_enabled() {
-        codegen::gen_move_registers_from_locals_to_memory(ctx);
-        codegen::gen_update_instruction_counter(ctx);
-        ctx.builder.const_i32(0);
-        ctx.builder.set_local(&ctx.instruction_counter);
-
+        let target_block = &ctx.builder.arg_local_initial_state.unsafe_clone();
+        ctx.builder.const_i32(ctx.wasm_table_index.to_u16() as i32);
         ctx.builder.const_i32(state_flags.to_u32() as i32);
-        ctx.builder.call_fn1_ret("jit_chain_target");
+        ctx.builder.get_local(&ctx.instruction_counter);
+        ctx.builder.call_fn3_ret("jit_chain_target");
         let target = ctx.builder.set_new_local();
         ctx.builder.get_local(&target);
         ctx.builder.const_i32(0);
         ctx.builder.ge_i32();
         ctx.builder.if_void();
-        ctx.builder.get_local(&target);
-        ctx.builder.const_i32(0xFFFF);
-        ctx.builder.and_i32();
-        ctx.builder.get_local(&target);
-        ctx.builder.const_i32(16);
-        ctx.builder.shr_u_i32();
-        ctx.builder.return_call_indirect_fn1();
+        {
+            ctx.builder.get_local(&target);
+            ctx.builder.const_i32(16);
+            ctx.builder.shr_u_i32();
+            ctx.builder.eqz_i32();
+            ctx.builder.if_void();
+            ctx.builder.get_local(&target);
+            ctx.builder.set_local(target_block);
+            ctx.builder.br(main_loop_label);
+            ctx.builder.block_end();
+
+            codegen::gen_move_registers_from_locals_to_memory(ctx);
+            codegen::gen_update_instruction_counter(ctx);
+            ctx.builder.get_local(&target);
+            ctx.builder.const_i32(0xFFFF);
+            ctx.builder.and_i32();
+            ctx.builder.get_local(&target);
+            ctx.builder.const_i32(16);
+            ctx.builder.shr_u_i32();
+            ctx.builder.return_call_indirect_fn1();
+        }
         ctx.builder.block_end();
         ctx.builder.free_local(target);
     }
@@ -1488,17 +1514,18 @@ fn jit_generate_module(
                     },
                     BasicBlockType::AbsoluteEip => {
                         // Check if we can stay in this module, if not exit
-                        codegen::gen_get_eip(ctx.builder);
-                        ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
-                        ctx.builder.const_i32(state_flags.to_u32() as i32);
-                        ctx.builder.call_fn3_ret("jit_find_cache_entry_in_page");
-                        ctx.builder.tee_local(target_block);
-                        ctx.builder.const_i32(0);
-                        ctx.builder.ge_i32();
-                        // TODO: Could make this unconditional by including exit_label in the main br_table
-                        ctx.builder.br_if(main_loop_label);
-
-                        gen_chain_or_exit(ctx, state_flags, block.last_instruction_addr);
+                        if !block_chaining_enabled() {
+                            codegen::gen_get_eip(ctx.builder);
+                            ctx.builder.const_i32(wasm_table_index.to_u16() as i32);
+                            ctx.builder.const_i32(state_flags.to_u32() as i32);
+                            ctx.builder.call_fn3_ret("jit_find_cache_entry_in_page");
+                            ctx.builder.tee_local(target_block);
+                            ctx.builder.const_i32(0);
+                            ctx.builder.ge_i32();
+                            // TODO: Could make this unconditional by including exit_label in the main br_table
+                            ctx.builder.br_if(main_loop_label);
+                        }
+                        gen_chain_or_exit(ctx, main_loop_label, state_flags, block.last_instruction_addr);
                     },
                     &BasicBlockType::Normal {
                         next_block_addr: None,
@@ -1521,7 +1548,7 @@ fn jit_generate_module(
                         }
 
                         codegen::gen_profiler_stat_increment(ctx.builder, stat::DIRECT_EXIT);
-                        gen_chain_or_exit(ctx, state_flags, block.last_instruction_addr);
+                        gen_chain_or_exit(ctx, main_loop_label, state_flags, block.last_instruction_addr);
                     },
                     &BasicBlockType::Normal {
                         next_block_addr: Some(next_block_addr),
@@ -1821,7 +1848,7 @@ fn jit_generate_module(
                                     ctx.builder,
                                     stat::CONDITIONAL_JUMP_EXIT,
                                 );
-                                gen_chain_or_exit(ctx, state_flags, block.last_instruction_addr);
+                                gen_chain_or_exit(ctx, main_loop_label, state_flags, block.last_instruction_addr);
 
                                 if is_first {
                                     ctx.builder.block_end();
