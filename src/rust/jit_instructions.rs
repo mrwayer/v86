@@ -4977,17 +4977,52 @@ fn gen_string_ins(ctx: &mut JitContext, ins: String, size: u8, prefix: u8) {
         }
     );
 
-    codegen::gen_move_registers_from_locals_to_memory(ctx);
-    if args == 1 {
-        ctx.builder.call_fn1(&name)
+    // The helper runs the instruction as the interpreter would: a page's
+    // worth at a time, putting eip back on the instruction when there is
+    // more to do, and raising a fault straight into the guest when a page
+    // is not there. Rather than end the block on every one -- a copy of a
+    // few pages cost an exit and an entry per page -- the compiled form
+    // runs the helper again while eip is back on the instruction, and
+    // leaves only when eip has gone somewhere else.
+    let start = ctx.start_of_current_instruction as i32 & 0xFFF;
+    let end = ctx.cpu.eip as i32 & 0xFFF;
+    codegen::gen_set_previous_eip_offset_from_eip_with_low_bits(ctx.builder, start);
+    codegen::gen_set_eip_low_bits(ctx.builder, end);
+    let again = ctx.builder.loop_void();
+    {
+        codegen::gen_move_registers_from_locals_to_memory(ctx);
+        if args == 1 {
+            ctx.builder.call_fn1(&name)
+        }
+        else if args == 2 {
+            ctx.builder.call_fn2(&name)
+        }
+        else {
+            dbg_assert!(false);
+        }
+        codegen::gen_move_registers_from_memory_to_locals(ctx);
+
+        codegen::gen_get_eip(ctx.builder);
+        ctx.builder
+            .load_fixed_i32(global_pointers::previous_ip as u32);
+        ctx.builder.eq_i32();
+        ctx.builder.if_void();
+        codegen::gen_set_eip_low_bits(ctx.builder, end);
+        ctx.builder.br(again);
+        ctx.builder.block_end();
     }
-    else if args == 2 {
-        ctx.builder.call_fn2(&name)
-    }
-    else {
-        dbg_assert!(false);
-    }
-    codegen::gen_move_registers_from_memory_to_locals(ctx);
+    ctx.builder.block_end();
+
+    codegen::gen_get_eip(ctx.builder);
+    ctx.builder
+        .load_fixed_i32(global_pointers::previous_ip as u32);
+    ctx.builder.const_i32(end - start);
+    ctx.builder.add_i32();
+    ctx.builder.ne_i32();
+    ctx.builder.if_void();
+    codegen::gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+    ctx.builder.br(ctx.exit_label);
+    ctx.builder.block_end();
 }
 
 pub fn instr_6C_jit(ctx: &mut JitContext) { gen_string_ins(ctx, String::INS, 8, 0) }
