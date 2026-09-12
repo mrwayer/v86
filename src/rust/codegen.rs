@@ -648,6 +648,10 @@ fn gen_safe_read(
     // Execute a virtual memory read. All slow paths (memory-mapped IO, tlb miss, page fault and
     // read across page boundary are handled in safe_read_jit_slow
 
+    if gen_flat_read(ctx, bits, address_local, where_to_write) {
+        return;
+    }
+
     //   entry <- tlb_data[addr >> 12 << 2]
     //   if entry & MASK == TLB_VALID && (addr & 0xFFF) <= 0x1000 - bytes: goto fast
     //   entry <- safe_read_jit_slow(addr, instruction_pointer)
@@ -776,6 +780,131 @@ fn gen_safe_read(
     }
 
     ctx.builder.free_local(entry_local);
+}
+
+/// The lowest address a flat read takes as plain RAM: below it lies the
+/// VGA window at A0000..C0000, which is mapped, and the real-mode memory a
+/// program in protected mode has no business reading quickly.
+const FLAT_READ_LOW: u32 = 0xC0000;
+
+/// A read compiled while paging is off. The linear address is the physical
+/// one, so a range check stands in for the TLB lookup: an address in plain
+/// RAM is read straight from it, and anything else -- the VGA window, past
+/// the end of RAM -- goes to the slow path the TLB path has, which also
+/// raises the fault. Measured on a title in a match, a third of every
+/// instruction retired reads memory, and the TLB path spent a dependent
+/// load and a dozen operations before the read itself. Code compiled this
+/// way is thrown away when paging is switched on.
+fn gen_flat_read(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    where_to_write: Option<u32>,
+) -> bool {
+    if !crate::jit::flat_memory_enabled()
+        || unsafe { *global_pointers::cr } & crate::cpu::cpu::CR0_PG != 0
+    {
+        return false;
+    }
+    let bytes = bits.bytes();
+    let ram = unsafe { *global_pointers::memory_size };
+    if ram < FLAT_READ_LOW + bytes {
+        return false;
+    }
+
+    // address - LOW <= ram - LOW - bytes, unsigned: one compare for both ends.
+    ctx.builder.get_local(&address_local);
+    ctx.builder.const_i32(FLAT_READ_LOW as i32);
+    ctx.builder.sub_i32();
+    ctx.builder.const_i32((ram - FLAT_READ_LOW - bytes) as i32);
+    ctx.builder.leu_i32();
+    ctx.builder.if_i32();
+    {
+        ctx.builder.get_local(&address_local);
+        ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
+        ctx.builder.add_i32();
+    }
+    ctx.builder.else_();
+    {
+        if cfg!(feature = "profiler") {
+            ctx.builder.get_local(&address_local);
+            ctx.builder.const_i32(0);
+            ctx.builder.call_fn2("report_safe_read_jit_slow");
+        }
+        ctx.builder.get_local(&address_local);
+        ctx.builder
+            .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+        match bits {
+            BitSize::BYTE => {
+                ctx.builder.call_fn2_ret("safe_read8_slow_jit");
+            },
+            BitSize::WORD => {
+                ctx.builder.call_fn2_ret("safe_read16_slow_jit");
+            },
+            BitSize::DWORD => {
+                ctx.builder.call_fn2_ret("safe_read32s_slow_jit");
+            },
+            BitSize::QWORD => {
+                ctx.builder.call_fn2_ret("safe_read64s_slow_jit");
+            },
+            BitSize::DQWORD => {
+                ctx.builder.call_fn2_ret("safe_read128s_slow_jit");
+            },
+        }
+        let entry_local = ctx.builder.tee_new_local();
+        ctx.builder.const_i32(1);
+        ctx.builder.and_i32();
+        if cfg!(feature = "profiler") {
+            ctx.builder.if_void();
+            gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+            ctx.builder.block_end();
+            ctx.builder.get_local(&entry_local);
+            ctx.builder.const_i32(1);
+            ctx.builder.and_i32();
+        }
+        ctx.builder.br_if(ctx.exit_with_fault_label);
+        ctx.builder.get_local(&entry_local);
+        ctx.builder.const_i32(!0xFFF);
+        ctx.builder.and_i32();
+        ctx.builder.get_local(&address_local);
+        ctx.builder.xor_i32();
+        ctx.builder.free_local(entry_local);
+    }
+    ctx.builder.block_end();
+
+    gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_FAST);
+
+    dbg_assert!((where_to_write != None) == (bits == BitSize::DQWORD));
+    match bits {
+        BitSize::BYTE => {
+            ctx.builder.load_u8(0);
+        },
+        BitSize::WORD => {
+            ctx.builder.load_unaligned_u16(0);
+        },
+        BitSize::DWORD => {
+            ctx.builder.load_unaligned_i32(0);
+        },
+        BitSize::QWORD => {
+            ctx.builder.load_unaligned_i64(0);
+        },
+        BitSize::DQWORD => {
+            let where_to_write = where_to_write.unwrap();
+            let phys_address_local = ctx.builder.set_new_local();
+            ctx.builder.const_i32(0);
+            ctx.builder.get_local(&phys_address_local);
+            ctx.builder.load_unaligned_i64(0);
+            ctx.builder.store_unaligned_i64(where_to_write);
+
+            ctx.builder.const_i32(0);
+            ctx.builder.get_local(&phys_address_local);
+            ctx.builder.load_unaligned_i64(8);
+            ctx.builder.store_unaligned_i64(where_to_write + 8);
+
+            ctx.builder.free_local(phys_address_local);
+        },
+    }
+    true
 }
 
 pub fn gen_get_phys_eip_plus_mem(ctx: &mut JitContext, address_local: &WasmLocal) {

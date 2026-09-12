@@ -91,6 +91,12 @@ pub fn fpu_inline_enabled() -> bool { unsafe { JIT_FPU_INLINE } }
 pub static mut JIT_DEAD_FLAGS: bool = false;
 pub fn dead_flags_enabled() -> bool { unsafe { JIT_DEAD_FLAGS } }
 
+/// Whether a read compiled while paging is off takes the linear address as
+/// the physical one, with a range check in place of the TLB. Configuration
+/// index 9.
+pub static mut JIT_FLAT_MEMORY: bool = true;
+pub fn flat_memory_enabled() -> bool { unsafe { JIT_FLAT_MEMORY } }
+
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 
 // How many instructions a page runs interpreted before it is compiled. A
@@ -2818,6 +2824,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         6 => JIT_BLOCK_CHAINING = value != 0,
         7 => JIT_FPU_INLINE = value != 0,
         8 => JIT_DEAD_FLAGS = value != 0,
+        9 => JIT_FLAT_MEMORY = value != 0,
         _ => dbg_assert!(false),
     }
 }

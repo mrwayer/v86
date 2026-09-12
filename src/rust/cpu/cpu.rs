@@ -3004,6 +3004,11 @@ pub unsafe fn set_cr0(cr0: i32) {
     if old_cr0 & (CR0_PG | CR0_WP) != cr0 & (CR0_PG | CR0_WP) {
         full_clear_tlb();
     }
+    // Code compiled while paging was off reads memory by linear address;
+    // none of it may survive paging being switched on, or off again.
+    if old_cr0 & CR0_PG != cr0 & CR0_PG {
+        jit::jit_clear_cache_js();
+    }
 
     if *cr.offset(4) & CR4_PAE != 0
         && old_cr0 & (CR0_CD | CR0_NW | CR0_PG) != cr0 & (CR0_CD | CR0_NW | CR0_PG)
