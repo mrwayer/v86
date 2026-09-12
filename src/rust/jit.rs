@@ -402,8 +402,20 @@ impl<'a> JitContext<'a> {
 
 pub const JIT_INSTR_BLOCK_BOUNDARY_FLAG: u32 = 1 << 0;
 
+/// Whether a block compiled while paging is off may run to its page's
+/// boundary and take an instruction across it. Configuration index 10.
+pub static mut JIT_CROSS_PAGE: bool = true;
+
+/// Whether the pages of code are one flat span: paging off, so the next
+/// page is always there and an instruction reaching into it decodes as it
+/// lies. With paging on the next page may not be mapped, and a block stops
+/// short of the end of its page as it always did.
+fn pages_are_flat() -> bool {
+    unsafe { JIT_CROSS_PAGE && *global_pointers::cr & cpu::CR0_PG == 0 }
+}
+
 pub fn is_near_end_of_page(address: u32) -> bool {
-    address & 0xFFF >= 0x1000 - MAX_INSTRUCTION_LENGTH
+    !pages_are_flat() && address & 0xFFF >= 0x1000 - MAX_INSTRUCTION_LENGTH
 }
 
 /// What an instruction does to the arithmetic flags, as far as deciding
@@ -837,8 +849,60 @@ fn jit_find_basic_blocks(
             let has_next_instruction = !analysis.no_next_instruction;
             current_address = cpu.eip;
 
-            dbg_assert!(Page::page_of(current_address) == Page::page_of(addr_before_instruction));
-            let current_virt_addr = to_visit & !0xFFF | current_address as i32 & 0xFFF;
+            let crossed =
+                Page::page_of(current_address) != Page::page_of(addr_before_instruction);
+            dbg_assert!(!crossed || pages_are_flat());
+            let current_virt_addr = if pages_are_flat() {
+                to_visit.wrapping_add((current_address - phys_addr) as i32)
+            }
+            else {
+                to_visit & !0xFFF | current_address as i32 & 0xFFF
+            };
+
+            if crossed {
+                // The instruction ended on the page's boundary or reached past
+                // it. A plain one is kept and the block goes on into the next
+                // page by a jump of a page, the way a jump to another page
+                // does, so that page joins the module and a write to the
+                // instruction's tail bytes throws the module away. Anything
+                // else -- a jump, a boundary, an STI, or a page the module
+                // may not take -- is left to the interpreter: the block stops
+                // short of it, with eip on it.
+                let plain = analysis.ty == AnalysisType::Normal && has_next_instruction;
+                let continuation = if plain {
+                    follow_jump(
+                        current_virt_addr,
+                        ctx,
+                        &mut pages,
+                        &mut page_blacklist,
+                        max_pages,
+                        &mut marked_as_entry,
+                        &mut to_visit_stack,
+                    )
+                }
+                else {
+                    None
+                };
+                let straddles = current_address & 0xFFF != 0;
+                if !plain || (straddles && continuation.is_none()) {
+                    profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+                    current_block.ty = BasicBlockType::Normal {
+                        next_block_addr: None,
+                        jump_offset: 0,
+                        jump_offset_is_32: true,
+                    };
+                    break;
+                }
+                current_block.number_of_instructions += 1;
+                current_block.last_instruction_addr = addr_before_instruction;
+                current_block.end_addr = current_address;
+                current_block.ty = BasicBlockType::Normal {
+                    next_block_addr: continuation,
+                    jump_offset: 0x1000,
+                    jump_offset_is_32: true,
+                };
+                break;
+            }
 
             if analysis.ty == AnalysisType::STI && is_near_end_of_page(current_address) {
                 // cut off before the STI so that it is handled by interpreted mode
@@ -2501,8 +2565,9 @@ fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
         let end_addr = ctx.cpu.eip;
 
         if end_addr == stop_addr {
-            // no page was crossed
-            dbg_assert!(Page::page_of(end_addr) == Page::page_of(start_addr));
+            // no page was crossed, unless the pages are flat and the last
+            // instruction reached into the next one
+            dbg_assert!(Page::page_of(end_addr) == Page::page_of(start_addr) || pages_are_flat());
             break;
         }
 
@@ -2894,6 +2959,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         7 => JIT_FPU_INLINE = value != 0,
         8 => JIT_DEAD_FLAGS = value != 0,
         9 => JIT_FLAT_MEMORY = value != 0,
+        10 => JIT_CROSS_PAGE = value != 0,
         _ => dbg_assert!(false),
     }
 }
