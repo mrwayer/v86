@@ -1,6 +1,6 @@
 use crate::cpu::cpu::{
-    tlb_data, FLAG_CARRY, FLAG_OVERFLOW, FLAG_SIGN, FLAG_ZERO, OPSIZE_16, OPSIZE_32, OPSIZE_8,
-    TLB_GLOBAL, TLB_HAS_CODE, TLB_NO_USER, TLB_READONLY, TLB_VALID,
+    page_has_code, tlb_data, FLAG_CARRY, FLAG_OVERFLOW, FLAG_SIGN, FLAG_ZERO, OPSIZE_16, OPSIZE_32,
+    OPSIZE_8, TLB_GLOBAL, TLB_HAS_CODE, TLB_NO_USER, TLB_READONLY, TLB_VALID,
 };
 use crate::cpu::global_pointers;
 use crate::cpu::memory;
@@ -557,6 +557,7 @@ pub fn gen_safe_read128(ctx: &mut JitContext, address_local: &WasmLocal, where_t
 }
 
 // only used internally for gen_safe_write
+#[derive(Clone, Copy)]
 enum GenSafeWriteValue<'a> {
     I32(&'a WasmLocal),
     I64(&'a WasmLocalI64),
@@ -782,10 +783,31 @@ fn gen_safe_read(
     ctx.builder.free_local(entry_local);
 }
 
-/// The lowest address a flat read takes as plain RAM: below it lies the
-/// VGA window at A0000..C0000, which is mapped, and the real-mode memory a
-/// program in protected mode has no business reading quickly.
-const FLAT_READ_LOW: u32 = 0xC0000;
+/// The lowest address a flat read or write takes as plain RAM: below it lies
+/// the VGA window at A0000..C0000, which is mapped, and the real-mode memory
+/// a program in protected mode has no business touching quickly.
+const FLAT_LOW: u32 = 0xC0000;
+
+/// How far above `FLAT_LOW` an access of this width may start and still lie
+/// in plain RAM, while paging is off and the flat path is wanted; `None`
+/// when the access must take the TLB path.
+fn flat_span(wanted: bool, bits: BitSize) -> Option<u32> {
+    if !wanted || unsafe { *global_pointers::cr } & crate::cpu::cpu::CR0_PG != 0 {
+        return None;
+    }
+    let ram = unsafe { *global_pointers::memory_size };
+    ram.checked_sub(FLAT_LOW + bits.bytes())
+}
+
+/// Pushes whether the access starting at `address` lies in plain RAM:
+/// address - LOW <= span, unsigned, is one compare for both ends.
+fn gen_flat_range_check(ctx: &mut JitContext, address_local: &WasmLocal, span: u32) {
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(FLAT_LOW as i32);
+    ctx.builder.sub_i32();
+    ctx.builder.const_i32(span as i32);
+    ctx.builder.leu_i32();
+}
 
 /// A read compiled while paging is off. The linear address is the physical
 /// one, so a range check stands in for the TLB lookup: an address in plain
@@ -801,23 +823,12 @@ fn gen_flat_read(
     address_local: &WasmLocal,
     where_to_write: Option<u32>,
 ) -> bool {
-    if !crate::jit::flat_memory_enabled()
-        || unsafe { *global_pointers::cr } & crate::cpu::cpu::CR0_PG != 0
-    {
-        return false;
-    }
-    let bytes = bits.bytes();
-    let ram = unsafe { *global_pointers::memory_size };
-    if ram < FLAT_READ_LOW + bytes {
-        return false;
-    }
+    let span = match flat_span(crate::jit::flat_memory_enabled(), bits) {
+        Some(span) => span,
+        None => return false,
+    };
 
-    // address - LOW <= ram - LOW - bytes, unsigned: one compare for both ends.
-    ctx.builder.get_local(&address_local);
-    ctx.builder.const_i32(FLAT_READ_LOW as i32);
-    ctx.builder.sub_i32();
-    ctx.builder.const_i32((ram - FLAT_READ_LOW - bytes) as i32);
-    ctx.builder.leu_i32();
+    gen_flat_range_check(ctx, address_local, span);
     ctx.builder.if_i32();
     {
         ctx.builder.get_local(&address_local);
@@ -993,6 +1004,10 @@ fn gen_safe_write(
     // Execute a virtual memory write. All slow paths (memory-mapped IO, tlb miss, page fault,
     // write across page boundary and page containing jitted code are handled in safe_write_jit_slow
 
+    if gen_flat_write(ctx, bits, address_local, value_local) {
+        return;
+    }
+
     //   entry <- tlb_data[addr >> 12 << 2]
     //   if entry & MASK == TLB_VALID && (addr & 0xFFF) <= 0x1000 - bytes: goto fast
     //   entry <- safe_write_jit_slow(addr, value, instruction_pointer)
@@ -1097,6 +1112,131 @@ fn gen_safe_write(
     ctx.builder.get_local(&address_local);
     ctx.builder.xor_i32();
 
+    gen_store(ctx, bits, value_local);
+
+    ctx.builder.free_local(entry_local);
+}
+
+/// Pushes whether a write of this width at `address` may go straight to
+/// RAM: it lies in plain RAM, it stays within its page, and the page holds
+/// no code. A write across a page, or into a page with code in it, takes
+/// the slow path, which dirties what it must.
+fn gen_flat_write_check(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    span: u32,
+) {
+    gen_flat_range_check(ctx, address_local, span);
+    if bits != BitSize::BYTE {
+        ctx.builder.get_local(address_local);
+        ctx.builder.const_i32(0xFFF);
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(0x1000 - bits.bytes() as i32);
+        ctx.builder.le_i32();
+        ctx.builder.and_i32();
+    }
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(12);
+    ctx.builder.shr_u_i32();
+    ctx.builder
+        .load_u8(unsafe { &page_has_code[0] as *const u8 as u32 });
+    ctx.builder.eqz_i32();
+    ctx.builder.and_i32();
+}
+
+/// A write compiled while paging is off, the way `gen_flat_read` reads: the
+/// range check stands in for the TLB lookup, and a byte per page stands in
+/// for the entry's has-code bit, so a write into a page holding code still
+/// goes the slow way and throws that code away. Anything else -- the VGA
+/// window, past the end of RAM, a write across a page -- goes to the slow
+/// path the TLB path has, which also raises the fault.
+fn gen_flat_write(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    value_local: GenSafeWriteValue,
+) -> bool {
+    let span = match flat_span(crate::jit::flat_writes_enabled(), bits) {
+        Some(span) => span,
+        None => return false,
+    };
+
+    gen_flat_write_check(ctx, bits, address_local, span);
+    ctx.builder.if_i32();
+    {
+        ctx.builder.get_local(address_local);
+        ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
+        ctx.builder.add_i32();
+    }
+    ctx.builder.else_();
+    {
+        if cfg!(feature = "profiler") {
+            ctx.builder.get_local(address_local);
+            ctx.builder.const_i32(0);
+            ctx.builder.call_fn2("report_safe_write_jit_slow");
+        }
+        ctx.builder.get_local(address_local);
+        match value_local {
+            GenSafeWriteValue::I32(local) => ctx.builder.get_local(local),
+            GenSafeWriteValue::I64(local) => ctx.builder.get_local_i64(local),
+            GenSafeWriteValue::TwoI64s(local1, local2) => {
+                ctx.builder.get_local_i64(local1);
+                ctx.builder.get_local_i64(local2)
+            },
+        }
+        ctx.builder.const_i32(
+            ctx.start_of_current_instruction as i32 & 0xFFF
+                | (ctx.wasm_table_index.to_u16() as i32) << 16,
+        );
+        match bits {
+            BitSize::BYTE => {
+                ctx.builder.call_fn3_ret("safe_write8_slow_jit");
+            },
+            BitSize::WORD => {
+                ctx.builder.call_fn3_ret("safe_write16_slow_jit");
+            },
+            BitSize::DWORD => {
+                ctx.builder.call_fn3_ret("safe_write32_slow_jit");
+            },
+            BitSize::QWORD => {
+                ctx.builder
+                    .call_fn3_i32_i64_i32_ret("safe_write64_slow_jit");
+            },
+            BitSize::DQWORD => {
+                ctx.builder
+                    .call_fn4_i32_i64_i64_i32_ret("safe_write128_slow_jit");
+            },
+        }
+        let entry_local = ctx.builder.tee_new_local();
+        ctx.builder.const_i32(1);
+        ctx.builder.and_i32();
+        if cfg!(feature = "profiler") {
+            ctx.builder.if_void();
+            gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+            ctx.builder.block_end();
+            ctx.builder.get_local(&entry_local);
+            ctx.builder.const_i32(1);
+            ctx.builder.and_i32();
+        }
+        ctx.builder.br_if(ctx.exit_with_fault_label);
+        ctx.builder.get_local(&entry_local);
+        ctx.builder.const_i32(!0xFFF);
+        ctx.builder.and_i32();
+        ctx.builder.get_local(address_local);
+        ctx.builder.xor_i32();
+        ctx.builder.free_local(entry_local);
+    }
+    ctx.builder.block_end();
+
+    gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_WRITE_FAST);
+
+    gen_store(ctx, bits, value_local);
+    true
+}
+
+/// Stores the value at the physical address on the stack.
+fn gen_store(ctx: &mut JitContext, bits: BitSize, value_local: GenSafeWriteValue) {
     match value_local {
         GenSafeWriteValue::I32(local) => ctx.builder.get_local(local),
         GenSafeWriteValue::I64(local) => ctx.builder.get_local_i64(local),
@@ -1128,8 +1268,6 @@ fn gen_safe_write(
         },
         BitSize::DQWORD => {}, // handled above
     }
-
-    ctx.builder.free_local(entry_local);
 }
 
 pub fn gen_safe_read_write(
@@ -1141,6 +1279,10 @@ pub fn gen_safe_read_write(
     // Execute a virtual memory read+write. All slow paths (memory-mapped IO, tlb miss, page fault,
     // write across page boundary and page containing jitted code are handled in
     // safe_read_write_jit_slow
+
+    if gen_flat_read_write(ctx, bits, address_local, f) {
+        return;
+    }
 
     //   entry <- tlb_data[addr >> 12 << 2]
     //   can_use_fast_path <- entry & MASK == TLB_VALID && (addr & 0xFFF) <= 0x1000 - bytes
@@ -1262,7 +1404,128 @@ pub fn gen_safe_read_write(
     // value is now on stack
 
     f(ctx);
+    gen_read_write_finish(
+        ctx,
+        bits,
+        address_local,
+        can_use_fast_path_local,
+        phys_addr_local,
+    );
+}
 
+/// The read-modify-write of `gen_safe_read_write`, compiled while paging is
+/// off: the check of a flat write decides the fast path, and the slow path
+/// is the one the TLB path has.
+fn gen_flat_read_write(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    f: &dyn Fn(&mut JitContext),
+) -> bool {
+    let span = match flat_span(crate::jit::flat_writes_enabled(), bits) {
+        Some(span) => span,
+        None => return false,
+    };
+
+    gen_flat_write_check(ctx, bits, address_local, span);
+    let can_use_fast_path_local = ctx.builder.tee_new_local();
+    ctx.builder.if_i32();
+    {
+        ctx.builder.get_local(address_local);
+        ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
+        ctx.builder.add_i32();
+    }
+    ctx.builder.else_();
+    {
+        if cfg!(feature = "profiler") {
+            ctx.builder.get_local(address_local);
+            ctx.builder.const_i32(0);
+            ctx.builder.call_fn2("report_safe_read_write_jit_slow");
+        }
+        ctx.builder.get_local(address_local);
+        ctx.builder.const_i32(
+            ctx.start_of_current_instruction as i32 & 0xFFF
+                | (ctx.wasm_table_index.to_u16() as i32) << 16,
+        );
+        match bits {
+            BitSize::BYTE => {
+                ctx.builder.call_fn2_ret("safe_read_write8_slow_jit");
+            },
+            BitSize::WORD => {
+                ctx.builder.call_fn2_ret("safe_read_write16_slow_jit");
+            },
+            BitSize::DWORD => {
+                ctx.builder.call_fn2_ret("safe_read_write32s_slow_jit");
+            },
+            BitSize::QWORD => {
+                ctx.builder.call_fn2_ret("safe_read_write64_slow_jit");
+            },
+            BitSize::DQWORD => {
+                dbg_assert!(false);
+            },
+        }
+        let entry_local = ctx.builder.tee_new_local();
+        ctx.builder.const_i32(1);
+        ctx.builder.and_i32();
+        if cfg!(feature = "profiler") {
+            ctx.builder.if_void();
+            gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+            ctx.builder.block_end();
+            ctx.builder.get_local(&entry_local);
+            ctx.builder.const_i32(1);
+            ctx.builder.and_i32();
+        }
+        ctx.builder.br_if(ctx.exit_with_fault_label);
+        ctx.builder.get_local(&entry_local);
+        ctx.builder.const_i32(!0xFFF);
+        ctx.builder.and_i32();
+        ctx.builder.get_local(address_local);
+        ctx.builder.xor_i32();
+        ctx.builder.free_local(entry_local);
+    }
+    ctx.builder.block_end();
+
+    gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_WRITE_FAST);
+
+    let phys_addr_local = ctx.builder.tee_new_local();
+    match bits {
+        BitSize::BYTE => {
+            ctx.builder.load_u8(0);
+        },
+        BitSize::WORD => {
+            ctx.builder.load_unaligned_u16(0);
+        },
+        BitSize::DWORD => {
+            ctx.builder.load_unaligned_i32(0);
+        },
+        BitSize::QWORD => {
+            ctx.builder.load_unaligned_i64(0);
+        },
+        BitSize::DQWORD => {
+            dbg_assert!(false);
+        },
+    }
+    f(ctx);
+    gen_read_write_finish(
+        ctx,
+        bits,
+        address_local,
+        can_use_fast_path_local,
+        phys_addr_local,
+    );
+    true
+}
+
+/// After `f` left the new value on the stack: writes it through the slow
+/// path when the fast one was not taken, then stores it at the physical
+/// address -- in RAM, or in the scratch page the slow path handed back.
+fn gen_read_write_finish(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    can_use_fast_path_local: WasmLocal,
+    phys_addr_local: WasmLocal,
+) {
     // TODO: Could get rid of this local by returning one from f
     let value_local = if bits == BitSize::QWORD {
         GenSafeReadWriteValue::I64(ctx.builder.set_new_local_i64())

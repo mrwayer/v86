@@ -309,7 +309,9 @@ pub const LOOP_COUNTER: i32 = 100_003;
 /// 8: exits from generated code that went straight into another module
 /// 9: exits that looked for one and found none compiled
 /// 10: exits that would have chained but the slice's budget was spent
-pub const STAT_COUNT: usize = 12;
+/// 11: instructions compiled without recording their flags
+/// 12: writes from generated code that took the slow path
+pub const STAT_COUNT: usize = 13;
 pub static mut STATS: [u64; STAT_COUNT] = [0; STAT_COUNT];
 
 /// The pages written most while holding code, so a report can name them:
@@ -467,6 +469,12 @@ pub struct Code {
 }
 
 pub static mut tlb_data: [i32; 0x100000] = [0; 0x100000];
+
+/// A byte per physical page saying whether it holds code, kept beside the
+/// TLB entry's bit: a write compiled while paging is off checks the byte,
+/// one load from a table whose touched part stays in cache, instead of the
+/// entry, and goes the slow way when it is set.
+pub static mut page_has_code: [u8; 0x100000] = [0; 0x100000];
 pub static mut tlb_code: [Option<ptr::NonNull<Code>>; 0x100000] = [None; 0x100000];
 
 pub static mut valid_tlb_entries: [i32; 10000] = [0; 10000];
@@ -2552,6 +2560,7 @@ pub unsafe fn trigger_pagefault(addr: i32, present: bool, write: bool, user: boo
 }
 
 pub fn tlb_set_has_code(physical_page: Page, has_code: bool) {
+    unsafe { page_has_code[physical_page.to_u32() as usize] = has_code as u8 };
     // Without paging a physical page is mapped by the virtual page of the same
     // number and by nothing else, so there is one entry to touch and no reason
     // to walk them all: a program whose data shares a page with code lost and
@@ -2595,6 +2604,9 @@ pub fn tlb_set_has_code(physical_page: Page, has_code: bool) {
 }
 pub fn tlb_set_has_code_multiple(physical_pages: &HashSet<Page>, has_code: bool) {
     let physical_pages: Vec<Page> = physical_pages.into_iter().copied().collect();
+    for page in &physical_pages {
+        unsafe { page_has_code[page.to_u32() as usize] = has_code as u8 };
+    }
     for i in 0..unsafe { valid_tlb_entries_count } {
         let page = unsafe { valid_tlb_entries[i as usize] };
         let entry = unsafe { tlb_data[page as usize] };
@@ -3004,8 +3016,8 @@ pub unsafe fn set_cr0(cr0: i32) {
     if old_cr0 & (CR0_PG | CR0_WP) != cr0 & (CR0_PG | CR0_WP) {
         full_clear_tlb();
     }
-    // Code compiled while paging was off reads memory by linear address;
-    // none of it may survive paging being switched on, or off again.
+    // Code compiled while paging was off reads and writes memory by linear
+    // address; none of it may survive paging being switched on, or off again.
     if old_cr0 & CR0_PG != cr0 & CR0_PG {
         jit::jit_clear_cache_js();
     }
@@ -3954,6 +3966,7 @@ pub unsafe fn safe_write_slow_jit(
     let eip_offset_in_page = eip_offset_in_page_and_wasm_table_index & 0xFFFF;
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
     dbg_assert!(u32::from(wasm_table_index) < jit::WASM_TABLE_SIZE);
+    note_stat(12, 1);
 
     let crosses_page = (addr & 0xFFF) + bitsize / 8 > 0x1000;
     let addr_low = match translate_address_write_jit(addr, wasm_table_index) {

@@ -97,6 +97,12 @@ pub fn dead_flags_enabled() -> bool { unsafe { JIT_DEAD_FLAGS } }
 pub static mut JIT_FLAT_MEMORY: bool = true;
 pub fn flat_memory_enabled() -> bool { unsafe { JIT_FLAT_MEMORY } }
 
+/// Whether a write compiled while paging is off does the same, with a byte
+/// per page saying whether the page holds code in place of the entry's bit.
+/// Configuration index 11, apart from the reads so each side measures alone.
+pub static mut JIT_FLAT_WRITES: bool = true;
+pub fn flat_writes_enabled() -> bool { unsafe { JIT_FLAT_WRITES } }
+
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 
 // How many instructions a page runs interpreted before it is compiled. A
@@ -2975,6 +2981,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         8 => JIT_DEAD_FLAGS = value != 0,
         9 => JIT_FLAT_MEMORY = value != 0,
         10 => JIT_CROSS_PAGE = value != 0,
+        11 => JIT_FLAT_WRITES = value != 0,
         _ => dbg_assert!(false),
     }
 }
