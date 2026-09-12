@@ -10,6 +10,10 @@ use crate::regs::{CS, DS, ES, FS, GS, SS};
 pub enum AnalysisType {
     Normal,
     BlockBoundary,
+    /// An instruction the compiler leaves to the interpreter's helper, which
+    /// may raise a fault into the guest: the block goes on after it once
+    /// eip is seen to be where the helper left it.
+    Fallback,
     Jump {
         offset: i32,
         is_32: bool,

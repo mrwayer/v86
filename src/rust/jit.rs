@@ -278,6 +278,12 @@ pub enum BasicBlockType {
     // Set eip to an absolute value (ret, jmp r/m, call r/m)
     AbsoluteEip,
     Exit,
+    /// Ends with an instruction the interpreter's helper runs, which may
+    /// raise a fault into the guest. Goes on to the next block when eip is
+    /// still where the helper was told to leave it, and leaves otherwise.
+    Fallback {
+        next_block_addr: u32,
+    },
 }
 
 pub struct BasicBlock {
@@ -963,6 +969,16 @@ fn jit_find_basic_blocks(
 
                     break;
                 },
+                AnalysisType::Fallback => {
+                    dbg_assert!(has_next_instruction);
+                    dbg_assert!(!analysis.absolute_jump);
+                    marked_as_entry.insert(current_virt_addr);
+                    to_visit_stack.push(current_virt_addr);
+                    current_block.ty = BasicBlockType::Fallback {
+                        next_block_addr: current_address,
+                    };
+                    break;
+                },
                 AnalysisType::BlockBoundary => {
                     // a block boundary but not a jump, get out
 
@@ -1032,6 +1048,18 @@ fn jit_find_basic_blocks(
     // delete edges pointing to blocks that were dropped (currently only due to STI near the end of a page)
     let known_addresses: HashSet<u32> = basic_blocks.keys().copied().collect();
     for block in basic_blocks.values_mut() {
+        // A fallback whose continuation was dropped (near the end of the page)
+        // is an exit like any other.
+        let continuation_dropped = match &block.ty {
+            BasicBlockType::Fallback { next_block_addr } => {
+                !known_addresses.contains(next_block_addr)
+            },
+            _ => false,
+        };
+        if continuation_dropped {
+            block.ty = BasicBlockType::Exit;
+            continue;
+        }
         match &mut block.ty {
             BasicBlockType::Normal {
                 next_block_addr, ..
@@ -1053,6 +1081,7 @@ fn jit_find_basic_blocks(
                 }
             },
             BasicBlockType::Exit | BasicBlockType::AbsoluteEip => {},
+            BasicBlockType::Fallback { .. } => {},
         }
     }
 
@@ -1213,6 +1242,7 @@ fn jit_analyze_and_generate(
                 } => format!(""),
                 BasicBlockType::Exit => format!(""),
                 BasicBlockType::AbsoluteEip => format!(""),
+                BasicBlockType::Fallback { next_block_addr } => format!("0x{:x}", next_block_addr),
             }
         );
     }
@@ -1639,6 +1669,7 @@ fn jit_generate_module(
                         },
                         BasicBlockType::Exit => {},
                         BasicBlockType::AbsoluteEip => {},
+                        BasicBlockType::Fallback { .. } => {},
                     };
                     codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
                     codegen::gen_move_registers_from_locals_to_memory(ctx);
@@ -1654,6 +1685,44 @@ fn jit_generate_module(
                         codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
                         codegen::gen_profiler_stat_increment(ctx.builder, stat::DIRECT_EXIT);
                         ctx.builder.br(ctx.exit_label);
+                    },
+                    &BasicBlockType::Fallback { next_block_addr } => {
+                        // The helper ran with the previous eip on the instruction
+                        // and eip set to after it; a fault has moved eip. On a
+                        // title in a match a status-word store and the SSE
+                        // control-word moves ended their blocks this way, an
+                        // exit and an entry each.
+                        codegen::gen_get_eip(ctx.builder);
+                        ctx.builder
+                            .load_fixed_i32(global_pointers::previous_ip as u32);
+                        ctx.builder
+                            .const_i32((block.end_addr - block.last_instruction_addr) as i32);
+                        ctx.builder.add_i32();
+                        ctx.builder.ne_i32();
+                        ctx.builder.if_void();
+                        codegen::gen_debug_track_jit_exit(ctx.builder, block.last_instruction_addr);
+                        ctx.builder.br(ctx.exit_label);
+                        ctx.builder.block_end();
+
+                        dbg_assert!(Page::page_of(next_block_addr) == Page::page_of(block.addr));
+                        if next_addr
+                            .as_ref()
+                            .map_or(false, |n| n.contains(&next_block_addr))
+                        {
+                            if next_addr.unwrap().len() > 1 {
+                                let target_index = *index_for_addr.get(&next_block_addr).unwrap();
+                                ctx.builder.const_i32(target_index.into());
+                                ctx.builder.set_local(target_block);
+                            }
+                        }
+                        else {
+                            let &(br, target_index) = label_for_addr.get(&next_block_addr).unwrap();
+                            if let Some(target_index) = target_index {
+                                ctx.builder.const_i32(target_index.into());
+                                ctx.builder.set_local(target_block);
+                            }
+                            ctx.builder.br(br);
+                        }
                     },
                     BasicBlockType::AbsoluteEip => {
                         // Check if we can stay in this module, if not exit
@@ -2348,7 +2417,7 @@ fn jit_generate_module(
 
 fn jit_generate_basic_block(ctx: &mut JitContext, block: &BasicBlock) {
     let needs_eip_updated = match block.ty {
-        BasicBlockType::Exit => true,
+        BasicBlockType::Exit | BasicBlockType::Fallback { .. } => true,
         _ => false,
     };
 

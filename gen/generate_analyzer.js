@@ -223,12 +223,18 @@ function gen_instruction_body_after_fixed_g(encoding, size)
     if(encoding.custom_sti) {
         instruction_postfix.push("analysis.ty = analysis::AnalysisType::STI;");
     }
-    else if(
-        encoding.block_boundary &&
-        // jump_offset_imm: Is a block boundary, but gets a different type (Jump) below
-        !encoding.jump_offset_imm || (!encoding.custom && encoding.e))
+    else if(encoding.block_boundary && !encoding.jump_offset_imm)
     {
+        // jump_offset_imm: Is a block boundary, but gets a different type (Jump) below
         instruction_postfix.push("analysis.ty = analysis::AnalysisType::BlockBoundary;");
+    }
+    else if(!encoding.custom && encoding.e)
+    {
+        // Left to the interpreter's helper: the block goes on after it unless a
+        // form of it raises #UD, which the arms above have marked already.
+        instruction_postfix.push(
+            "if analysis.ty == analysis::AnalysisType::Normal { " +
+            "analysis.ty = analysis::AnalysisType::Fallback; }");
     }
 
     if(encoding.no_next_instruction)

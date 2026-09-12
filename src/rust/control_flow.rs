@@ -57,6 +57,9 @@ pub fn make_graph(basic_blocks: &Vec<BasicBlock>) -> Graph {
                 next_block_addr: None,
                 ..
             } => {},
+            &BasicBlockType::Fallback { next_block_addr } => {
+                edges.insert(next_block_addr);
+            },
             BasicBlockType::Exit => {},
             BasicBlockType::AbsoluteEip => {
                 // Not necessary: We generate a loop around the outer brtable unconditionally
