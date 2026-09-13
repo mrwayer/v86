@@ -103,6 +103,18 @@ pub fn flat_memory_enabled() -> bool { unsafe { JIT_FLAT_MEMORY } }
 pub static mut JIT_FLAT_WRITES: bool = true;
 pub fn flat_writes_enabled() -> bool { unsafe { JIT_FLAT_WRITES } }
 
+/// Whether the x87 forms beyond arithmetic, loads and stores keep a register
+/// tagged as a double: the exchange, the constants, the sign changes, the
+/// compares, a register-to-register store, a square root, and the integer
+/// loads and stores whose value a double holds exactly. Without them a
+/// register that passes through one of those forms loses its tag, and every
+/// later operation on it takes its helper arm for the rest of its life.
+/// Configuration index 12; meaningless with index 7 off.
+pub static mut JIT_X87_TAGGED_MORE: bool = true;
+pub fn x87_tagged_more_enabled() -> bool {
+    unsafe { JIT_FPU_INLINE && JIT_X87_TAGGED_MORE }
+}
+
 pub static mut MAX_EXTRA_BASIC_BLOCKS: u32 = 250;
 
 // How many instructions a page runs interpreted before it is compiled. A
@@ -3050,6 +3062,7 @@ pub unsafe fn set_jit_config(index: u32, value: u32) {
         9 => JIT_FLAT_MEMORY = value != 0,
         10 => JIT_CROSS_PAGE = value != 0,
         11 => JIT_FLAT_WRITES = value != 0,
+        12 => JIT_X87_TAGGED_MORE = value != 0,
         _ => dbg_assert!(false),
     }
 }
@@ -3065,6 +3078,7 @@ pub unsafe fn get_jit_config(index: u32) -> u32 {
         5 => crate::softfloat::FAST_F80 as u32,
         6 => JIT_BLOCK_CHAINING as u32,
         7 => JIT_FPU_INLINE as u32,
+        12 => JIT_X87_TAGGED_MORE as u32,
         _ => 0,
     }
 }

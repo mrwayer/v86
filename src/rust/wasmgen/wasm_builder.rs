@@ -692,6 +692,10 @@ impl WasmBuilder {
         self.instruction_body.push(op::OP_I64CONST);
         write_leb_i64(&mut self.instruction_body, v);
     }
+    pub fn const_f64(&mut self, v: f64) {
+        self.instruction_body.push(op::OP_F64CONST);
+        self.instruction_body.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
 
     pub fn load_fixed_u8(&mut self, addr: u32) {
         self.const_i32(addr as i32);
@@ -880,7 +884,19 @@ impl WasmBuilder {
     pub fn sub_f64(&mut self) { self.instruction_body.push(op::OP_F64SUB); }
     pub fn mul_f64(&mut self) { self.instruction_body.push(op::OP_F64MUL); }
     pub fn div_f64(&mut self) { self.instruction_body.push(op::OP_F64DIV); }
-    //pub fn convert_i32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI32); }
+    pub fn neg_f64(&mut self) { self.instruction_body.push(op::OP_F64NEG); }
+    pub fn abs_f64(&mut self) { self.instruction_body.push(op::OP_F64ABS); }
+    pub fn sqrt_f64(&mut self) { self.instruction_body.push(op::OP_F64SQRT); }
+    pub fn nearest_f64(&mut self) { self.instruction_body.push(op::OP_F64NEAREST); }
+    pub fn trunc_f64(&mut self) { self.instruction_body.push(op::OP_F64TRUNC); }
+    pub fn floor_f64(&mut self) { self.instruction_body.push(op::OP_F64FLOOR); }
+    pub fn ceil_f64(&mut self) { self.instruction_body.push(op::OP_F64CEIL); }
+    pub fn eq_f64(&mut self) { self.instruction_body.push(op::OP_F64EQ); }
+    pub fn lt_f64(&mut self) { self.instruction_body.push(op::OP_F64LT); }
+    pub fn le_f64(&mut self) { self.instruction_body.push(op::OP_F64LE); }
+    /// Only for a value already known to be in range: out of it, wasm traps.
+    pub fn trunc_f64_to_i32(&mut self) { self.instruction_body.push(op::OP_I32TRUNCSF64); }
+    pub fn convert_i32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI32); }
     //pub fn convert_i64_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI64); }
     pub fn extend_unsigned_i32_to_i64(&mut self) {
         self.instruction_body.push(op::OP_I64EXTENDUI32);

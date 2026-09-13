@@ -313,8 +313,19 @@ pub const LOOP_COUNTER: i32 = 100_003;
 /// 12: writes from generated code that took the slow path
 /// 13: of the writes into a page holding code, ones outside any compiled
 ///     instruction's bytes, which kept the code and the page's hotness
-pub const STAT_COUNT: usize = 14;
+/// 14: x87 operations that fell to their helper because a register they read
+///     no longer held a tagged double
+pub const STAT_COUNT: usize = 15;
 pub static mut STATS: [u64; STAT_COUNT] = [0; STAT_COUNT];
+
+/// An x87 operation that had an inline arm took its helper arm instead.
+pub const STAT_X87_TAG_LOST: usize = 14;
+
+/// Where a counter lives, for generated code to increment it in place.
+pub fn stat_address(index: usize) -> u32 {
+    dbg_assert!(index < STAT_COUNT);
+    (unsafe { &raw mut STATS[index] }) as u32
+}
 
 /// The pages written most while holding code, so a report can name them:
 /// a page that mixes data with code is written for as long as the program

@@ -1,7 +1,9 @@
 use crate::cpu::cpu::{
-    page_has_code, tlb_data, FLAG_CARRY, FLAG_OVERFLOW, FLAG_SIGN, FLAG_ZERO, OPSIZE_16, OPSIZE_32,
-    OPSIZE_8, TLB_GLOBAL, TLB_HAS_CODE, TLB_NO_USER, TLB_READONLY, TLB_VALID,
+    page_has_code, stat_address, tlb_data, FLAG_CARRY, FLAG_OVERFLOW, FLAG_SIGN, FLAG_ZERO,
+    OPSIZE_16, OPSIZE_32, OPSIZE_8, STAT_X87_TAG_LOST, TLB_GLOBAL, TLB_HAS_CODE, TLB_NO_USER,
+    TLB_READONLY, TLB_VALID,
 };
+use crate::cpu::fpu::{FPU_C0, FPU_C2, FPU_C3, FPU_EX_I, FPU_RESULT_FLAGS};
 use crate::cpu::global_pointers;
 use crate::cpu::memory;
 use crate::jit::{Instruction, InstructionOperand, InstructionOperandDest, JitContext};
@@ -10,6 +12,7 @@ use crate::modrm::ModrmByte;
 use crate::opstats;
 use crate::profiler;
 use crate::regs;
+use crate::softfloat::F80;
 use crate::wasmgen::wasm_builder::{WasmBuilder, WasmLocal, WasmLocalI64};
 
 pub fn gen_add_cs_offset(ctx: &mut JitContext) {
@@ -2954,6 +2957,13 @@ pub fn gen_fpu_load_i64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 
 const FPU_RELAXED_TAG: i32 = 0x7FFE;
 
+/// Counts an operation that had an inline arm but took its helper arm because
+/// a register it reads no longer held a tagged double. Emitted on the helper
+/// arm only, where a call is being made anyway, so the inline arm pays nothing.
+fn gen_note_tag_lost(builder: &mut WasmBuilder) {
+    builder.increment_fixed_i64(stat_address(STAT_X87_TAG_LOST), 1);
+}
+
 #[derive(Copy, Clone)]
 pub enum FpuFastBinOp {
     Add,
@@ -3068,6 +3078,7 @@ pub fn gen_fpu_binop_m32(
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_store_tagged_f64(ctx, &target_addr);
     ctx.builder.else_();
+    gen_note_tag_lost(ctx.builder);
     ctx.builder.const_i32(target_sti as i32);
     gen_fpu_load_m32(ctx, modrm_slow);
     ctx.builder.call_fn3_i32_i64_i32(helper);
@@ -3101,6 +3112,7 @@ pub fn gen_fpu_binop_m64(
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_store_tagged_f64(ctx, &target_addr);
     ctx.builder.else_();
+    gen_note_tag_lost(ctx.builder);
     ctx.builder.const_i32(target_sti as i32);
     gen_fpu_load_m64(ctx, modrm_slow);
     ctx.builder.call_fn3_i32_i64_i32(helper);
@@ -3134,6 +3146,7 @@ pub fn gen_fpu_binop_sti(
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_store_tagged_f64(ctx, &target_addr);
     ctx.builder.else_();
+    gen_note_tag_lost(ctx.builder);
     ctx.builder.const_i32(target_sti as i32);
     gen_fpu_get_sti(ctx, sti);
     ctx.builder.call_fn3_i32_i64_i32(helper);
@@ -3243,6 +3256,7 @@ pub fn gen_fpu_push_sti(ctx: &mut JitContext, sti: u32) {
     gen_fpu_load_tagged_f64(ctx, &addr);
     gen_fpu_push_f64(ctx);
     ctx.builder.else_();
+    gen_note_tag_lost(ctx.builder);
     gen_fpu_get_sti(ctx, sti);
     ctx.builder.call_fn2_i64_i32("fpu_push");
     ctx.builder.block_end();
@@ -3264,6 +3278,7 @@ pub fn gen_fpu_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
         gen_safe_write32(ctx, &address_local, &value_local);
         ctx.builder.free_local(value_local);
         ctx.builder.else_();
+        gen_note_tag_lost(ctx.builder);
         gen_fpu_get_sti(ctx, 0);
         ctx.builder.call_fn2_i64_i32_ret("f80_to_f32");
         let value_local = ctx.builder.set_new_local();
@@ -3299,6 +3314,7 @@ pub fn gen_fpu_store_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
         gen_safe_write64(ctx, &address_local, &value_local);
         ctx.builder.free_local_i64(value_local);
         ctx.builder.else_();
+        gen_note_tag_lost(ctx.builder);
         gen_fpu_get_sti(ctx, 0);
         ctx.builder.call_fn2_i64_i32_ret_i64("f80_to_f64");
         let value_local = ctx.builder.set_new_local_i64();
@@ -3318,6 +3334,516 @@ pub fn gen_fpu_store_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
         gen_fpu_pop(ctx);
     }
     ctx.builder.free_local(address_local);
+}
+
+// The forms beyond arithmetic, loads and stores that keep a register tagged.
+//
+// A helper reads a register through `fpu_canonical` and writes back the 80-bit
+// format, so a value that passes through one loses its tag -- and then every
+// later inline operation on it takes its helper arm too, for the rest of that
+// value's life. Measured before this: the slow arm of `fstp m32` alone was
+// 0.7% of the page in a match, reached because st(0) had come out of an
+// exchange, a constant or a compare. These forms carry the tag through
+// instead. What they give up is what the inline path already gave up: the
+// stack-fault bookkeeping, and the eleven low mantissa bits the double
+// shortcut does not keep. Configuration index 12.
+
+/// The index of st(i) in the register file, in a local.
+fn gen_fpu_st_index(ctx: &mut JitContext, i: u32) -> WasmLocal {
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.const_i32(i as i32);
+    ctx.builder.add_i32();
+    ctx.builder.const_i32(7);
+    ctx.builder.and_i32();
+    ctx.builder.set_new_local()
+}
+
+/// The address of the register at `index`, in a local.
+fn gen_fpu_addr_of_index(ctx: &mut JitContext, index: &WasmLocal) -> WasmLocal {
+    ctx.builder.get_local(index);
+    ctx.builder.const_i32(16);
+    ctx.builder.mul_i32();
+    ctx.builder.const_i32(global_pointers::fpu_st as i32);
+    ctx.builder.add_i32();
+    ctx.builder.set_new_local()
+}
+
+/// The double on the stack into a register that already carries the tag.
+fn gen_fpu_store_f64_keeping_tag(ctx: &mut JitContext, addr: &WasmLocal) {
+    ctx.builder.reinterpret_f64_as_i64();
+    let bits = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local(addr);
+    ctx.builder.get_local_i64(&bits);
+    ctx.builder.store_unaligned_i64(0);
+    ctx.builder.free_local_i64(bits);
+}
+
+/// The bits held in a local, read as a double.
+fn gen_get_f64(ctx: &mut JitContext, bits: &WasmLocalI64) {
+    ctx.builder.get_local_i64(bits);
+    ctx.builder.reinterpret_i64_as_f64();
+}
+
+/// `fxch st(i)`: two tagged registers swapped where they lie, both keeping the
+/// tag they already carry.
+pub fn gen_fpu_fxch(ctx: &mut JitContext, i: u32) {
+    if !crate::jit::x87_tagged_more_enabled() {
+        gen_fn1_const(ctx.builder, "fpu_fxch", i);
+        return;
+    }
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    let sti_addr = gen_fpu_st_addr(ctx, i);
+    gen_fpu_tag_ok(ctx, &st0_addr);
+    gen_fpu_tag_ok(ctx, &sti_addr);
+    ctx.builder.and_i32();
+    ctx.builder.if_void();
+    ctx.builder.get_local(&st0_addr);
+    ctx.builder.load_unaligned_i64(0);
+    let saved = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local(&st0_addr);
+    ctx.builder.get_local(&sti_addr);
+    ctx.builder.load_unaligned_i64(0);
+    ctx.builder.store_unaligned_i64(0);
+    ctx.builder.get_local(&sti_addr);
+    ctx.builder.get_local_i64(&saved);
+    ctx.builder.store_unaligned_i64(0);
+    ctx.builder.free_local_i64(saved);
+    ctx.builder.else_();
+    gen_note_tag_lost(ctx.builder);
+    gen_fn1_const(ctx.builder, "fpu_fxch", i);
+    ctx.builder.block_end();
+    ctx.builder.free_local(sti_addr);
+    ctx.builder.free_local(st0_addr);
+}
+
+/// `fld1`, `fldz`, `fldpi` and the rest of the group: the constant pushed as a
+/// tagged double.
+///
+/// The value pushed is the constant rounded to a double, which is the value
+/// the shortcut gives it at its first use in any case -- every arithmetic
+/// operation converts its operands to a double first -- so this is the
+/// precision position the shortcut already takes, not a wider one.
+pub fn gen_fpu_push_const(ctx: &mut JitContext, r: u32) {
+    if !crate::jit::x87_tagged_more_enabled() {
+        gen_fn1_const(ctx.builder, "instr16_D9_5_reg", r);
+        return;
+    }
+    let value = match r {
+        0 => F80::ONE,
+        1 => F80::LN_10 / F80::LN_2,
+        2 => F80::LOG2_E,
+        3 => F80::PI,
+        4 => F80::LN_2 / F80::LN_10,
+        5 => F80::LN_2,
+        _ => F80::ZERO,
+    };
+    ctx.builder.const_f64(f64::from_bits(value.to_f64()));
+    gen_fpu_push_f64(ctx);
+}
+
+/// `fchs` and `fabs`: the sign of a tagged double changed where it lies.
+pub fn gen_fpu_sign_op(ctx: &mut JitContext, r: u32, absolute: bool) {
+    if !crate::jit::x87_tagged_more_enabled() {
+        gen_fn1_const(ctx.builder, "instr16_D9_4_reg", r);
+        return;
+    }
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_tag_ok(ctx, &st0_addr);
+    ctx.builder.if_void();
+    gen_fpu_load_tagged_f64(ctx, &st0_addr);
+    if absolute {
+        ctx.builder.abs_f64();
+    }
+    else {
+        ctx.builder.neg_f64();
+    }
+    gen_fpu_store_f64_keeping_tag(ctx, &st0_addr);
+    ctx.builder.else_();
+    gen_note_tag_lost(ctx.builder);
+    gen_fn1_const(ctx.builder, "instr16_D9_4_reg", r);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+}
+
+/// `fsqrt`: the root taken at the precision the arithmetic already runs at.
+pub fn gen_fpu_fsqrt(ctx: &mut JitContext, r: u32) {
+    if !crate::jit::x87_tagged_more_enabled() {
+        gen_fn1_const(ctx.builder, "instr16_D9_7_reg", r);
+        return;
+    }
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_tag_ok(ctx, &st0_addr);
+    ctx.builder.if_void();
+    gen_fpu_load_tagged_f64(ctx, &st0_addr);
+    ctx.builder.sqrt_f64();
+    gen_fpu_store_f64_keeping_tag(ctx, &st0_addr);
+    ctx.builder.else_();
+    gen_note_tag_lost(ctx.builder);
+    gen_fn1_const(ctx.builder, "instr16_D9_7_reg", r);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+}
+
+/// `fst st(i)` / `fstp st(i)`: a tagged st(0) copied to another register, tag
+/// and all, so the copy is as cheap to use as the original.
+pub fn gen_fpu_fst_sti(ctx: &mut JitContext, i: u32, pop: bool) {
+    let helper = if pop { "fpu_fstp" } else { "fpu_fst" };
+    if !crate::jit::x87_tagged_more_enabled() {
+        gen_fn1_const(ctx.builder, helper, i);
+        return;
+    }
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_tag_ok(ctx, &st0_addr);
+    ctx.builder.if_void();
+    let index = gen_fpu_st_index(ctx, i);
+    let dst = gen_fpu_addr_of_index(ctx, &index);
+    ctx.builder.get_local(&dst);
+    ctx.builder.get_local(&st0_addr);
+    ctx.builder.load_unaligned_i64(0);
+    ctx.builder.store_unaligned_i64(0);
+    ctx.builder.get_local(&dst);
+    ctx.builder.const_i32(FPU_RELAXED_TAG);
+    ctx.builder.store_unaligned_u16(8);
+    // A register carrying the tag was written by generated code, so it is not
+    // empty, and the helper marks the destination full in exactly that case.
+    ctx.builder
+        .const_i32(global_pointers::fpu_stack_empty as i32);
+    ctx.builder.const_i32(1);
+    ctx.builder.get_local(&index);
+    ctx.builder.shl_i32();
+    ctx.builder.const_i32(-1);
+    ctx.builder.xor_i32();
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+    ctx.builder.and_i32();
+    ctx.builder.store_u8(0);
+    ctx.builder.free_local(dst);
+    ctx.builder.free_local(index);
+    if pop {
+        gen_fpu_pop(ctx);
+    }
+    ctx.builder.else_();
+    gen_note_tag_lost(ctx.builder);
+    gen_fn1_const(ctx.builder, helper, i);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+}
+
+/// What an x87 memory operand holds.
+#[derive(Copy, Clone, PartialEq)]
+pub enum FpuMemOperand {
+    F32,
+    F64,
+    I16,
+    I32,
+}
+
+/// The operand as a double on the stack.
+fn gen_fpu_load_mem_as_f64(ctx: &mut JitContext, modrm_byte: ModrmByte, kind: FpuMemOperand) {
+    match kind {
+        FpuMemOperand::F32 => gen_fpu_load_m32_as_f64(ctx, modrm_byte),
+        FpuMemOperand::F64 => gen_fpu_load_m64_as_f64(ctx, modrm_byte),
+        FpuMemOperand::I16 => {
+            gen_modrm_resolve_safe_read16(ctx, modrm_byte);
+            sign_extend_i16(ctx.builder);
+            ctx.builder.convert_i32_to_f64();
+        },
+        FpuMemOperand::I32 => {
+            gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+            ctx.builder.convert_i32_to_f64();
+        },
+    }
+}
+
+/// The operand in the 80-bit form the helpers take.
+fn gen_fpu_load_mem_as_f80(ctx: &mut JitContext, modrm_byte: ModrmByte, kind: FpuMemOperand) {
+    match kind {
+        FpuMemOperand::F32 => gen_fpu_load_m32(ctx, modrm_byte),
+        FpuMemOperand::F64 => gen_fpu_load_m64(ctx, modrm_byte),
+        FpuMemOperand::I16 => gen_fpu_load_i16(ctx, modrm_byte),
+        FpuMemOperand::I32 => gen_fpu_load_i32(ctx, modrm_byte),
+    }
+}
+
+/// `fild m16` / `fild m32`: an integer a double holds exactly, pushed tagged.
+pub fn gen_fpu_push_int(ctx: &mut JitContext, modrm_byte: ModrmByte, kind: FpuMemOperand) {
+    if !crate::jit::x87_tagged_more_enabled() {
+        gen_fpu_load_mem_as_f80(ctx, modrm_byte, kind);
+        ctx.builder.call_fn2_i64_i32("fpu_push");
+        return;
+    }
+    gen_fpu_load_mem_as_f64(ctx, modrm_byte, kind);
+    gen_fpu_push_f64(ctx);
+}
+
+/// Whether a NaN operand is an invalid operation: it is for `fcom` and its
+/// forms, and is not for the quiet `fucom` family.
+#[derive(Copy, Clone, PartialEq)]
+pub enum FpuNanSignals {
+    Yes,
+    No,
+}
+
+/// The bits one ordering of two doubles contributes: `less` when the first is
+/// smaller, `equal` when they are the same value (so a negative zero equals a
+/// positive one, as the processor has it), and `unordered` when either is a
+/// NaN -- in which case neither of the other two holds, so the three are
+/// disjoint and an `or` composes them.
+fn gen_fpu_cmp_bits(
+    ctx: &mut JitContext,
+    x: &WasmLocalI64,
+    y: &WasmLocalI64,
+    less: i32,
+    equal: i32,
+    unordered: i32,
+) {
+    gen_get_f64(ctx, x);
+    gen_get_f64(ctx, y);
+    ctx.builder.lt_f64();
+    ctx.builder.const_i32(less);
+    ctx.builder.mul_i32();
+
+    gen_get_f64(ctx, x);
+    gen_get_f64(ctx, y);
+    ctx.builder.eq_f64();
+    ctx.builder.const_i32(equal);
+    ctx.builder.mul_i32();
+    ctx.builder.or_i32();
+
+    // A value that does not equal itself is a NaN.
+    gen_get_f64(ctx, x);
+    gen_get_f64(ctx, x);
+    ctx.builder.eq_f64();
+    ctx.builder.eqz_i32();
+    gen_get_f64(ctx, y);
+    gen_get_f64(ctx, y);
+    ctx.builder.eq_f64();
+    ctx.builder.eqz_i32();
+    ctx.builder.or_i32();
+    ctx.builder.const_i32(unordered);
+    ctx.builder.mul_i32();
+    ctx.builder.or_i32();
+}
+
+/// The ordering into C3, C2 and C0 of the status word, the exception flags it
+/// already holds left standing, as the helper leaves them.
+fn gen_fpu_cmp_deposit(
+    ctx: &mut JitContext,
+    signals: FpuNanSignals,
+    x: &WasmLocalI64,
+    y: &WasmLocalI64,
+) {
+    let unordered = (FPU_C0 | FPU_C2 | FPU_C3) as i32
+        | if signals == FpuNanSignals::Yes { FPU_EX_I as i32 } else { 0 };
+    ctx.builder
+        .const_i32(global_pointers::fpu_status_word as i32);
+    ctx.builder
+        .load_fixed_u16(global_pointers::fpu_status_word as u32);
+    ctx.builder.const_i32(!(FPU_RESULT_FLAGS as i32));
+    ctx.builder.and_i32();
+    gen_fpu_cmp_bits(ctx, x, y, FPU_C0 as i32, FPU_C3 as i32, unordered);
+    ctx.builder.or_i32();
+    ctx.builder.store_aligned_u16(0);
+}
+
+/// A compare against st(i), inline when both registers carry the tag.
+pub fn gen_fpu_fcom_sti(
+    ctx: &mut JitContext,
+    sti: u32,
+    signals: FpuNanSignals,
+    pops: u32,
+    helper: &mut dyn FnMut(&mut JitContext),
+) {
+    if !crate::jit::x87_tagged_more_enabled() {
+        helper(ctx);
+        return;
+    }
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    let sti_addr = gen_fpu_st_addr(ctx, sti);
+    gen_fpu_tag_ok(ctx, &st0_addr);
+    gen_fpu_tag_ok(ctx, &sti_addr);
+    ctx.builder.and_i32();
+    ctx.builder.if_void();
+    ctx.builder.get_local(&st0_addr);
+    ctx.builder.load_unaligned_i64(0);
+    let x = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local(&sti_addr);
+    ctx.builder.load_unaligned_i64(0);
+    let y = ctx.builder.set_new_local_i64();
+    gen_fpu_cmp_deposit(ctx, signals, &x, &y);
+    ctx.builder.free_local_i64(y);
+    ctx.builder.free_local_i64(x);
+    for _ in 0..pops {
+        gen_fpu_pop(ctx);
+    }
+    ctx.builder.else_();
+    gen_note_tag_lost(ctx.builder);
+    helper(ctx);
+    ctx.builder.block_end();
+    ctx.builder.free_local(sti_addr);
+    ctx.builder.free_local(st0_addr);
+}
+
+/// A compare against memory, inline when st(0) carries the tag.
+pub fn gen_fpu_fcom_mem(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    kind: FpuMemOperand,
+    pops: u32,
+    helper: &str,
+    signals: FpuNanSignals,
+) {
+    if !crate::jit::x87_tagged_more_enabled() {
+        gen_fpu_load_mem_as_f80(ctx, modrm_byte, kind);
+        ctx.builder.call_fn2_i64_i32(helper);
+        return;
+    }
+    let modrm_slow = modrm_byte.clone();
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_tag_ok(ctx, &st0_addr);
+    ctx.builder.if_void();
+    ctx.builder.get_local(&st0_addr);
+    ctx.builder.load_unaligned_i64(0);
+    let x = ctx.builder.set_new_local_i64();
+    gen_fpu_load_mem_as_f64(ctx, modrm_byte, kind);
+    ctx.builder.reinterpret_f64_as_i64();
+    let y = ctx.builder.set_new_local_i64();
+    gen_fpu_cmp_deposit(ctx, signals, &x, &y);
+    ctx.builder.free_local_i64(y);
+    ctx.builder.free_local_i64(x);
+    for _ in 0..pops {
+        gen_fpu_pop(ctx);
+    }
+    ctx.builder.else_();
+    gen_note_tag_lost(ctx.builder);
+    gen_fpu_load_mem_as_f80(ctx, modrm_slow, kind);
+    ctx.builder.call_fn2_i64_i32(helper);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+}
+
+/// The double in `value` rounded to an integer the way the control word's
+/// rounding field says: to nearest with ties to even, down, up, or towards
+/// zero -- one wasm instruction each, chosen without a branch, so a program
+/// that changes the mode around every conversion, as a C runtime's
+/// float-to-integer does, pays nothing for the change.
+fn gen_fpu_round_by_control_word(ctx: &mut JitContext, value: &WasmLocalI64) {
+    ctx.builder
+        .load_fixed_u16(global_pointers::fpu_control_word as u32);
+    ctx.builder.const_i32(10);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(3);
+    ctx.builder.and_i32();
+    let mode = ctx.builder.set_new_local();
+    gen_get_f64(ctx, value);
+    ctx.builder.nearest_f64();
+    for rounding in 1..4 {
+        gen_get_f64(ctx, value);
+        match rounding {
+            1 => ctx.builder.floor_f64(),
+            2 => ctx.builder.ceil_f64(),
+            _ => ctx.builder.trunc_f64(),
+        }
+        ctx.builder.get_local(&mode);
+        ctx.builder.const_i32(rounding);
+        ctx.builder.ne_i32();
+        ctx.builder.select();
+    }
+    ctx.builder.free_local(mode);
+}
+
+/// `fist` / `fistp`, to a half or a word: the value rounded as the control
+/// word says and written, where the result is inside the width. Outside it, and
+/// for a NaN, the processor raises the invalid-operation exception and writes
+/// the width's most negative value; that, and a register without the tag, is
+/// what the helper arm is for.
+pub fn gen_fpu_store_int(
+    ctx: &mut JitContext,
+    modrm_byte: ModrmByte,
+    wide: bool,
+    pop: bool,
+    helper: &str,
+) {
+    gen_modrm_resolve(ctx, modrm_byte);
+    let address_local = ctx.builder.set_new_local();
+    if crate::jit::x87_tagged_more_enabled() {
+        let (low, high) = if wide {
+            (-2147483648.0, 2147483647.0)
+        }
+        else {
+            (-32768.0, 32767.0)
+        };
+        let done = ctx.builder.block_void();
+        let st0_addr = gen_fpu_st_addr(ctx, 0);
+        gen_fpu_tag_ok(ctx, &st0_addr);
+        ctx.builder.if_void();
+        ctx.builder.get_local(&st0_addr);
+        ctx.builder.load_unaligned_i64(0);
+        let value = ctx.builder.set_new_local_i64();
+        gen_fpu_round_by_control_word(ctx, &value);
+        ctx.builder.reinterpret_f64_as_i64();
+        let rounded = ctx.builder.set_new_local_i64();
+        // A NaN fails both comparisons, so it leaves by the same arm as a
+        // value the width cannot hold.
+        ctx.builder.const_f64(low);
+        gen_get_f64(ctx, &rounded);
+        ctx.builder.le_f64();
+        gen_get_f64(ctx, &rounded);
+        ctx.builder.const_f64(high);
+        ctx.builder.le_f64();
+        ctx.builder.and_i32();
+        ctx.builder.if_void();
+        gen_get_f64(ctx, &rounded);
+        ctx.builder.trunc_f64_to_i32();
+        let value_local = ctx.builder.set_new_local();
+        if wide {
+            gen_safe_write32(ctx, &address_local, &value_local);
+        }
+        else {
+            gen_safe_write16(ctx, &address_local, &value_local);
+        }
+        ctx.builder.free_local(value_local);
+        if pop {
+            gen_fpu_pop(ctx);
+        }
+        ctx.builder.br(done);
+        ctx.builder.block_end();
+        ctx.builder.free_local_i64(rounded);
+        ctx.builder.free_local_i64(value);
+        ctx.builder.else_();
+        gen_note_tag_lost(ctx.builder);
+        ctx.builder.block_end();
+        ctx.builder.free_local(st0_addr);
+        gen_fpu_store_int_by_helper(ctx, &address_local, wide, pop, helper);
+        ctx.builder.block_end();
+    }
+    else {
+        gen_fpu_store_int_by_helper(ctx, &address_local, wide, pop, helper);
+    }
+    ctx.builder.free_local(address_local);
+}
+
+fn gen_fpu_store_int_by_helper(
+    ctx: &mut JitContext,
+    address_local: &WasmLocal,
+    wide: bool,
+    pop: bool,
+    helper: &str,
+) {
+    gen_fpu_get_sti(ctx, 0);
+    ctx.builder.call_fn2_i64_i32_ret(helper);
+    let value_local = ctx.builder.set_new_local();
+    if wide {
+        gen_safe_write32(ctx, address_local, &value_local);
+    }
+    else {
+        gen_safe_write16(ctx, address_local, &value_local);
+    }
+    ctx.builder.free_local(value_local);
+    if pop {
+        gen_fpu_pop(ctx);
+    }
 }
 
 pub fn gen_trigger_de(ctx: &mut JitContext) {

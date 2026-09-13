@@ -5,13 +5,13 @@ use crate::softfloat::{Precision, RoundingMode, F80};
 
 use std::f64;
 
-const FPU_C0: u16 = 0x100;
+pub const FPU_C0: u16 = 0x100;
 const FPU_C1: u16 = 0x200;
-const FPU_C2: u16 = 0x400;
-const FPU_C3: u16 = 0x4000;
-const FPU_RESULT_FLAGS: u16 = FPU_C0 | FPU_C1 | FPU_C2 | FPU_C3;
+pub const FPU_C2: u16 = 0x400;
+pub const FPU_C3: u16 = 0x4000;
+pub const FPU_RESULT_FLAGS: u16 = FPU_C0 | FPU_C1 | FPU_C2 | FPU_C3;
 
-const FPU_EX_I: u16 = 1 << 0; // invalid operation
+pub const FPU_EX_I: u16 = 1 << 0; // invalid operation
 #[allow(dead_code)]
 const FPU_EX_D: u16 = 1 << 1; // denormal operand
 const FPU_EX_Z: u16 = 1 << 2; // zero divide
@@ -97,7 +97,7 @@ pub unsafe fn fpu_get_sti(mut i: i32) -> F80 {
 #[no_mangle]
 pub unsafe fn fpu_get_sti_f64(mut i: i32) -> f64 {
     i = i + *fpu_stack_ptr as i32 & 7;
-    f64::from_bits((*fpu_st.offset(i as isize)).to_f64())
+    f64::from_bits(fpu_canonical(*fpu_st.offset(i as isize)).to_f64())
 }
 
 #[no_mangle]
