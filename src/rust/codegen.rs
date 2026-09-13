@@ -1,7 +1,10 @@
 use crate::cpu::cpu::{
-    page_has_code, stat_address, tlb_data, FLAG_CARRY, FLAG_OVERFLOW, FLAG_SIGN, FLAG_ZERO,
-    OPSIZE_16, OPSIZE_32, OPSIZE_8, STAT_X87_TAG_LOST, TLB_GLOBAL, TLB_HAS_CODE, TLB_NO_USER,
-    TLB_READONLY, TLB_VALID,
+    page_has_code, stat_address, tlb_data, x87_site_address, FLAG_CARRY, FLAG_OVERFLOW, FLAG_SIGN,
+    FLAG_ZERO, OPSIZE_16, OPSIZE_32, OPSIZE_8, STAT_X87_TAG_LOST, TLB_GLOBAL, TLB_HAS_CODE,
+    TLB_NO_USER, TLB_READONLY, TLB_VALID, X87_SITE_ARM_BINOP_M32, X87_SITE_ARM_BINOP_M64,
+    X87_SITE_ARM_BINOP_STI, X87_SITE_ARM_FCOM_MEM, X87_SITE_ARM_FCOM_STI, X87_SITE_ARM_FLD_STI,
+    X87_SITE_ARM_FST_STI, X87_SITE_ARM_FSQRT, X87_SITE_ARM_FXCH, X87_SITE_ARM_SIGN,
+    X87_SITE_ARM_STORE_INT, X87_SITE_ARM_STORE_M32, X87_SITE_ARM_STORE_M64,
 };
 use crate::cpu::fpu::{FPU_C0, FPU_C2, FPU_C3, FPU_EX_I, FPU_RESULT_FLAGS};
 use crate::cpu::global_pointers;
@@ -2958,10 +2961,13 @@ pub fn gen_fpu_load_i64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 const FPU_RELAXED_TAG: i32 = 0x7FFE;
 
 /// Counts an operation that had an inline arm but took its helper arm because
-/// a register it reads no longer held a tagged double. Emitted on the helper
-/// arm only, where a call is being made anyway, so the inline arm pays nothing.
-fn gen_note_tag_lost(builder: &mut WasmBuilder) {
+/// a register it reads no longer held a tagged double, once in the total and
+/// once under the form that paid, so a report can name it. Emitted on the
+/// helper arm only, where a call is being made anyway, so the inline arm pays
+/// nothing for either.
+fn gen_note_tag_lost(builder: &mut WasmBuilder, site: usize) {
     builder.increment_fixed_i64(stat_address(STAT_X87_TAG_LOST), 1);
+    builder.increment_fixed_i64(x87_site_address(site), 1);
 }
 
 #[derive(Copy, Clone)]
@@ -3078,7 +3084,7 @@ pub fn gen_fpu_binop_m32(
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_store_tagged_f64(ctx, &target_addr);
     ctx.builder.else_();
-    gen_note_tag_lost(ctx.builder);
+    gen_note_tag_lost(ctx.builder, X87_SITE_ARM_BINOP_M32);
     ctx.builder.const_i32(target_sti as i32);
     gen_fpu_load_m32(ctx, modrm_slow);
     ctx.builder.call_fn3_i32_i64_i32(helper);
@@ -3112,7 +3118,7 @@ pub fn gen_fpu_binop_m64(
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_store_tagged_f64(ctx, &target_addr);
     ctx.builder.else_();
-    gen_note_tag_lost(ctx.builder);
+    gen_note_tag_lost(ctx.builder, X87_SITE_ARM_BINOP_M64);
     ctx.builder.const_i32(target_sti as i32);
     gen_fpu_load_m64(ctx, modrm_slow);
     ctx.builder.call_fn3_i32_i64_i32(helper);
@@ -3146,7 +3152,7 @@ pub fn gen_fpu_binop_sti(
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_store_tagged_f64(ctx, &target_addr);
     ctx.builder.else_();
-    gen_note_tag_lost(ctx.builder);
+    gen_note_tag_lost(ctx.builder, X87_SITE_ARM_BINOP_STI);
     ctx.builder.const_i32(target_sti as i32);
     gen_fpu_get_sti(ctx, sti);
     ctx.builder.call_fn3_i32_i64_i32(helper);
@@ -3256,7 +3262,7 @@ pub fn gen_fpu_push_sti(ctx: &mut JitContext, sti: u32) {
     gen_fpu_load_tagged_f64(ctx, &addr);
     gen_fpu_push_f64(ctx);
     ctx.builder.else_();
-    gen_note_tag_lost(ctx.builder);
+    gen_note_tag_lost(ctx.builder, X87_SITE_ARM_FLD_STI);
     gen_fpu_get_sti(ctx, sti);
     ctx.builder.call_fn2_i64_i32("fpu_push");
     ctx.builder.block_end();
@@ -3278,7 +3284,7 @@ pub fn gen_fpu_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
         gen_safe_write32(ctx, &address_local, &value_local);
         ctx.builder.free_local(value_local);
         ctx.builder.else_();
-        gen_note_tag_lost(ctx.builder);
+        gen_note_tag_lost(ctx.builder, X87_SITE_ARM_STORE_M32);
         gen_fpu_get_sti(ctx, 0);
         ctx.builder.call_fn2_i64_i32_ret("f80_to_f32");
         let value_local = ctx.builder.set_new_local();
@@ -3314,7 +3320,7 @@ pub fn gen_fpu_store_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
         gen_safe_write64(ctx, &address_local, &value_local);
         ctx.builder.free_local_i64(value_local);
         ctx.builder.else_();
-        gen_note_tag_lost(ctx.builder);
+        gen_note_tag_lost(ctx.builder, X87_SITE_ARM_STORE_M64);
         gen_fpu_get_sti(ctx, 0);
         ctx.builder.call_fn2_i64_i32_ret_i64("f80_to_f64");
         let value_local = ctx.builder.set_new_local_i64();
@@ -3410,7 +3416,7 @@ pub fn gen_fpu_fxch(ctx: &mut JitContext, i: u32) {
     ctx.builder.store_unaligned_i64(0);
     ctx.builder.free_local_i64(saved);
     ctx.builder.else_();
-    gen_note_tag_lost(ctx.builder);
+    gen_note_tag_lost(ctx.builder, X87_SITE_ARM_FXCH);
     gen_fn1_const(ctx.builder, "fpu_fxch", i);
     ctx.builder.block_end();
     ctx.builder.free_local(sti_addr);
@@ -3460,7 +3466,7 @@ pub fn gen_fpu_sign_op(ctx: &mut JitContext, r: u32, absolute: bool) {
     }
     gen_fpu_store_f64_keeping_tag(ctx, &st0_addr);
     ctx.builder.else_();
-    gen_note_tag_lost(ctx.builder);
+    gen_note_tag_lost(ctx.builder, X87_SITE_ARM_SIGN);
     gen_fn1_const(ctx.builder, "instr16_D9_4_reg", r);
     ctx.builder.block_end();
     ctx.builder.free_local(st0_addr);
@@ -3479,7 +3485,7 @@ pub fn gen_fpu_fsqrt(ctx: &mut JitContext, r: u32) {
     ctx.builder.sqrt_f64();
     gen_fpu_store_f64_keeping_tag(ctx, &st0_addr);
     ctx.builder.else_();
-    gen_note_tag_lost(ctx.builder);
+    gen_note_tag_lost(ctx.builder, X87_SITE_ARM_FSQRT);
     gen_fn1_const(ctx.builder, "instr16_D9_7_reg", r);
     ctx.builder.block_end();
     ctx.builder.free_local(st0_addr);
@@ -3524,7 +3530,7 @@ pub fn gen_fpu_fst_sti(ctx: &mut JitContext, i: u32, pop: bool) {
         gen_fpu_pop(ctx);
     }
     ctx.builder.else_();
-    gen_note_tag_lost(ctx.builder);
+    gen_note_tag_lost(ctx.builder, X87_SITE_ARM_FST_STI);
     gen_fn1_const(ctx.builder, helper, i);
     ctx.builder.block_end();
     ctx.builder.free_local(st0_addr);
@@ -3678,7 +3684,7 @@ pub fn gen_fpu_fcom_sti(
         gen_fpu_pop(ctx);
     }
     ctx.builder.else_();
-    gen_note_tag_lost(ctx.builder);
+    gen_note_tag_lost(ctx.builder, X87_SITE_ARM_FCOM_STI);
     helper(ctx);
     ctx.builder.block_end();
     ctx.builder.free_local(sti_addr);
@@ -3716,7 +3722,7 @@ pub fn gen_fpu_fcom_mem(
         gen_fpu_pop(ctx);
     }
     ctx.builder.else_();
-    gen_note_tag_lost(ctx.builder);
+    gen_note_tag_lost(ctx.builder, X87_SITE_ARM_FCOM_MEM);
     gen_fpu_load_mem_as_f80(ctx, modrm_slow, kind);
     ctx.builder.call_fn2_i64_i32(helper);
     ctx.builder.block_end();
@@ -3812,7 +3818,7 @@ pub fn gen_fpu_store_int(
         ctx.builder.free_local_i64(rounded);
         ctx.builder.free_local_i64(value);
         ctx.builder.else_();
-        gen_note_tag_lost(ctx.builder);
+        gen_note_tag_lost(ctx.builder, X87_SITE_ARM_STORE_INT);
         ctx.builder.block_end();
         ctx.builder.free_local(st0_addr);
         gen_fpu_store_int_by_helper(ctx, &address_local, wide, pop, helper);

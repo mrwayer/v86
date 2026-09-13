@@ -1,6 +1,7 @@
 use crate::cpu::cpu::*;
 use crate::cpu::fpu::{
-    fpu_load_m80, fpu_load_status_word, fpu_set_status_word, fpu_store_m80, set_control_word,
+    fpu_load_m80, fpu_load_status_word, fpu_set_status_word, fpu_store_m80, fpu_write_st_at,
+    set_control_word,
 };
 use crate::cpu::global_pointers::*;
 use crate::paging::OrPageFault;
@@ -419,7 +420,11 @@ pub unsafe fn fxrstor(addr: i32) {
 
     for i in 0..8 {
         let reg_index = *fpu_stack_ptr as i32 + i & 7;
-        *fpu_st.offset(reg_index as isize) = fpu_load_m80(addr + 32 + (i << 4)).unwrap();
+        fpu_write_st_at(
+            reg_index,
+            fpu_load_m80(addr + 32 + (i << 4)).unwrap(),
+            X87_SITE_FXRSTOR,
+        );
     }
 
     for i in 0..8 {

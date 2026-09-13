@@ -4003,6 +4003,14 @@ pub fn instr_DE_7_reg_jit(ctx: &mut JitContext, r: u32) {
     instr_group_DE_reg_jit(ctx, r, "fpu_fdivr")
 }
 
+pub fn instr_DF_0_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    codegen::gen_fpu_push_int(ctx, modrm_byte, FpuMemOperand::I16);
+}
+pub fn instr_DF_0_reg_jit(ctx: &mut JitContext, r: u32) {
+    codegen::gen_fn1_const(ctx.builder, "fpu_ffree", r);
+    codegen::gen_fn0_const(ctx.builder, "fpu_pop");
+}
+
 pub fn instr_DF_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     codegen::gen_modrm_resolve(ctx, modrm_byte);
     let address_local = ctx.builder.set_new_local();

@@ -97,6 +97,36 @@ fn to_f64_fast(x: &F80) -> Option<f64> {
     Some(f64::from_bits(sign | biased << 52 | f52))
 }
 
+/// The bits of the double that holds this value with nothing lost, if one does.
+///
+/// Integer arithmetic on the two words: no conversion is run, so no exception
+/// flag is touched and the answer costs a handful of instructions. A value it
+/// accepts converts back to exactly the bits it came from, which is what lets
+/// a register be left in the form generated code reads inline. What it refuses
+/// is everything the double format cannot hold with the same value: an
+/// infinity, any NaN, an unnormal, a denormal at either end, and a mantissa
+/// with anything in the eleven low bits a double has no room for.
+#[inline]
+pub fn f80_exact_f64_bits(x: &F80) -> Option<u64> {
+    let sign = (x.sign_exponent as u64 >> 15) << 63;
+    let exponent = (x.sign_exponent & 0x7FFF) as i32;
+    if exponent == 0 {
+        return if x.mantissa == 0 { Some(sign) } else { None };
+    }
+    if exponent == 0x7FFF || x.mantissa >> 63 == 0 {
+        return None;
+    }
+    let biased = exponent - 0x3FFF + 1023;
+    if biased < 1 || biased > 2046 {
+        return None;
+    }
+    let fraction = x.mantissa & 0x7FFF_FFFF_FFFF_FFFF;
+    if fraction & 0x7FF != 0 {
+        return None;
+    }
+    Some(sign | (biased as u64) << 52 | fraction >> 11)
+}
+
 /// A normal or a zero as a single, rounded once from the full mantissa.
 #[inline]
 fn to_f32_fast(x: &F80) -> Option<i32> {

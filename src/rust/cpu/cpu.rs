@@ -321,6 +321,76 @@ pub static mut STATS: [u64; STAT_COUNT] = [0; STAT_COUNT];
 /// An x87 operation that had an inline arm took its helper arm instead.
 pub const STAT_X87_TAG_LOST: usize = 14;
 
+/// Where an x87 value stops being a tagged double, named rather than only
+/// counted.
+///
+/// Counter 14 says that an inline form took its helper arm because a register
+/// it read was left in the 80-bit format, but not by what, and a single number
+/// cannot be acted on: the instruction that canonicalised the register may be
+/// nowhere near the one that pays for it. Two groups answer that. The first is
+/// counted where a helper writes a register the double format cannot hold, and
+/// names the instruction that wrote it; the second on the helper arm of each
+/// inline form, and names the form that then paid. Both sit on paths that are
+/// making a call already, so the inline arms cost nothing for the account.
+pub const X87_SITE_COUNT: usize = 48;
+pub static mut X87_SITES: [u64; X87_SITE_COUNT] = [0; X87_SITE_COUNT];
+
+// A helper wrote a register: whether the double format held the value, and
+// which instruction wrote it when it did not.
+pub const X87_SITE_WRITE_EXACT: usize = 0;
+pub const X87_SITE_WRITE_WIDE: usize = 1;
+pub const X87_SITE_ARITH: usize = 2;
+pub const X87_SITE_FST_STI: usize = 3;
+pub const X87_SITE_FXCH: usize = 4;
+pub const X87_SITE_FCMOVCC: usize = 5;
+pub const X87_SITE_FILD_M16: usize = 6;
+pub const X87_SITE_FILD_M32: usize = 7;
+pub const X87_SITE_FILD_M64: usize = 8;
+pub const X87_SITE_FLD_M32: usize = 9;
+pub const X87_SITE_FLD_M64: usize = 10;
+pub const X87_SITE_FLD_M80: usize = 11;
+pub const X87_SITE_PUSH_OTHER: usize = 12;
+pub const X87_SITE_FRNDINT: usize = 13;
+pub const X87_SITE_FSCALE: usize = 14;
+pub const X87_SITE_FPREM: usize = 15;
+pub const X87_SITE_FSQRT: usize = 16;
+pub const X87_SITE_SIGN: usize = 17;
+pub const X87_SITE_TRANSCENDENTAL: usize = 18;
+pub const X87_SITE_FRSTOR: usize = 19;
+pub const X87_SITE_FXRSTOR: usize = 20;
+pub const X87_SITE_MMX: usize = 21;
+
+// An inline form called its helper because a register it reads lost the tag.
+pub const X87_SITE_ARM_BINOP_M32: usize = 24;
+pub const X87_SITE_ARM_BINOP_M64: usize = 25;
+pub const X87_SITE_ARM_BINOP_STI: usize = 26;
+pub const X87_SITE_ARM_FLD_STI: usize = 27;
+pub const X87_SITE_ARM_STORE_M32: usize = 28;
+pub const X87_SITE_ARM_STORE_M64: usize = 29;
+pub const X87_SITE_ARM_FXCH: usize = 30;
+pub const X87_SITE_ARM_SIGN: usize = 31;
+pub const X87_SITE_ARM_FSQRT: usize = 32;
+pub const X87_SITE_ARM_FST_STI: usize = 33;
+pub const X87_SITE_ARM_FCOM_STI: usize = 34;
+pub const X87_SITE_ARM_FCOM_MEM: usize = 35;
+pub const X87_SITE_ARM_STORE_INT: usize = 36;
+
+#[inline(always)]
+pub unsafe fn note_x87_site(site: usize) {
+    X87_SITES[site] = X87_SITES[site].wrapping_add(1);
+}
+
+/// Where a site's counter lives, for generated code to increment it in place.
+pub fn x87_site_address(site: usize) -> u32 {
+    dbg_assert!(site < X87_SITE_COUNT);
+    (unsafe { &raw mut X87_SITES[site] }) as u32
+}
+
+#[no_mangle]
+pub unsafe fn bottlify_x87_site(site: u32) -> f64 {
+    if (site as usize) < X87_SITE_COUNT { X87_SITES[site as usize] as f64 } else { -1.0 }
+}
+
 /// Where a counter lives, for generated code to increment it in place.
 pub fn stat_address(index: usize) -> u32 {
     dbg_assert!(index < STAT_COUNT);
@@ -4342,6 +4412,9 @@ pub unsafe fn read_mmx32s(r: i32) -> i32 { (*fpu_st.offset(r as isize)).mantissa
 pub unsafe fn read_mmx64s(r: i32) -> u64 { (*fpu_st.offset(r as isize)).mantissa }
 
 pub unsafe fn write_mmx_reg64(r: i32, data: u64) {
+    // The registers are shared with x87, so this leaves one in a form no x87
+    // reader can use; a program that mixes the two shows up here.
+    note_x87_site(X87_SITE_MMX);
     *fpu_st.offset(r as isize) = softfloat::F80 {
         mantissa: data,
         sign_exponent: 0xFFFF,

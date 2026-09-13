@@ -23,7 +23,41 @@ const FPU_EX_P: u16 = 1 << 5; // precision
 const FPU_EX_SF: u16 = 1 << 6;
 
 pub fn fpu_write_st(index: i32, value: F80) {
+    fpu_write_st_at(index, value, X87_SITE_ARITH)
+}
+
+/// Stores a register, leaving it in the form generated code reads inline
+/// whenever the double format holds the value with nothing lost.
+///
+/// A helper that writes a register in the 80-bit format costs more than its own
+/// call: the tag is gone, so every later inline operation on that value takes
+/// its helper arm too, for the rest of the value's life. The test is integer
+/// arithmetic on the two words -- no conversion is run, so the exception flags
+/// the caller is about to read are untouched -- and a value it accepts reads
+/// back through `fpu_canonical` as exactly the bits it came from. What the tag
+/// changes is the precision later arithmetic on that value runs at, which is
+/// the trade the inline path already makes for every value it produces itself;
+/// configuration index 12 is the switch for both. `site` names the instruction,
+/// so a report can say what the double format is still refusing.
+pub fn fpu_write_st_at(index: i32, mut value: F80, site: usize) {
     dbg_assert!(index >= 0 && index < 8);
+    if crate::jit::x87_tagged_more_enabled() && value.sign_exponent != FPU_RELAXED_TAG {
+        unsafe {
+            match crate::softfloat::f80_exact_f64_bits(&value) {
+                Some(bits) => {
+                    note_x87_site(X87_SITE_WRITE_EXACT);
+                    value = F80 {
+                        mantissa: bits,
+                        sign_exponent: FPU_RELAXED_TAG,
+                    };
+                },
+                None => {
+                    note_x87_site(X87_SITE_WRITE_WIDE);
+                    note_x87_site(site);
+                },
+            }
+        }
+    }
     unsafe {
         *fpu_st.offset(index as isize) = value;
     }
@@ -191,11 +225,11 @@ pub unsafe fn fpu_fcmovcc(condition: bool, r: i32) {
     // fulfilled
     let x = fpu_get_sti(r);
     if fpu_sti_empty(r) {
-        fpu_write_st(*fpu_stack_ptr as i32, F80::INDEFINITE_NAN)
+        fpu_write_st_at(*fpu_stack_ptr as i32, F80::INDEFINITE_NAN, X87_SITE_FCMOVCC)
     }
     else {
         if condition {
-            fpu_write_st(*fpu_stack_ptr as i32, x);
+            fpu_write_st_at(*fpu_stack_ptr as i32, x, X87_SITE_FCMOVCC);
             *fpu_stack_empty &= !(1 << *fpu_stack_ptr)
         };
     }
@@ -267,22 +301,29 @@ pub unsafe fn fpu_fdivr(target_index: i32, val: F80) {
 #[no_mangle]
 pub unsafe fn fpu_ffree(r: i32) { *fpu_stack_empty |= 1 << (*fpu_stack_ptr as i32 + r & 7); }
 
-pub unsafe fn fpu_fildm16(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_i16(addr))); }
-pub unsafe fn fpu_fildm32(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_i32(addr))); }
-pub unsafe fn fpu_fildm64(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_i64(addr))); }
+pub unsafe fn fpu_fildm16(addr: i32) {
+    fpu_push_at(return_on_pagefault!(fpu_load_i16(addr)), X87_SITE_FILD_M16)
+}
+pub unsafe fn fpu_fildm32(addr: i32) {
+    fpu_push_at(return_on_pagefault!(fpu_load_i32(addr)), X87_SITE_FILD_M32)
+}
+pub unsafe fn fpu_fildm64(addr: i32) {
+    fpu_push_at(return_on_pagefault!(fpu_load_i64(addr)), X87_SITE_FILD_M64)
+}
 
 #[no_mangle]
-pub unsafe fn fpu_push(x: F80) {
+pub unsafe fn fpu_push(x: F80) { fpu_push_at(x, X87_SITE_PUSH_OTHER) }
+pub unsafe fn fpu_push_at(x: F80, site: usize) {
     *fpu_stack_ptr = *fpu_stack_ptr - 1 & 7;
     if 0 != *fpu_stack_empty >> *fpu_stack_ptr & 1 {
         *fpu_status_word &= !FPU_C1;
         *fpu_stack_empty &= !(1 << *fpu_stack_ptr);
-        fpu_write_st(*fpu_stack_ptr as i32, x);
+        fpu_write_st_at(*fpu_stack_ptr as i32, x, site);
     }
     else {
         *fpu_status_word |= FPU_C1;
         fpu_stack_fault();
-        fpu_write_st(*fpu_stack_ptr as i32, F80::INDEFINITE_NAN);
+        fpu_write_st_at(*fpu_stack_ptr as i32, F80::INDEFINITE_NAN, site);
     };
 }
 pub unsafe fn fpu_finit() {
@@ -469,11 +510,19 @@ pub unsafe fn fpu_set_status_word(sw: u16) {
     *fpu_stack_ptr = (sw >> 11 & 7) as u8;
 }
 
-pub unsafe fn fpu_fldm32(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m32(addr))); }
-pub unsafe fn fpu_fldm64(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m64(addr))); }
-pub unsafe fn fpu_fldm80(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m80(addr))); }
+pub unsafe fn fpu_fldm32(addr: i32) {
+    fpu_push_at(return_on_pagefault!(fpu_load_m32(addr)), X87_SITE_FLD_M32)
+}
+pub unsafe fn fpu_fldm64(addr: i32) {
+    fpu_push_at(return_on_pagefault!(fpu_load_m64(addr)), X87_SITE_FLD_M64)
+}
+pub unsafe fn fpu_fldm80(addr: i32) {
+    fpu_push_at(return_on_pagefault!(fpu_load_m80(addr)), X87_SITE_FLD_M80)
+}
 #[no_mangle]
-pub unsafe fn fpu_fldm80_without_fault(addr: i32) { fpu_push(fpu_load_m80(addr).unwrap()); }
+pub unsafe fn fpu_fldm80_without_fault(addr: i32) {
+    fpu_push_at(fpu_load_m80(addr).unwrap(), X87_SITE_FLD_M80)
+}
 
 #[no_mangle]
 pub unsafe fn fpu_fmul(target_index: i32, val: F80) {
@@ -499,7 +548,7 @@ pub unsafe fn fpu_fprem(ieee: bool) {
         else {
             fpu_zero_fault();
         }
-        fpu_write_st(*fpu_stack_ptr as i32, F80::INDEFINITE_NAN);
+        fpu_write_st_at(*fpu_stack_ptr as i32, F80::INDEFINITE_NAN, X87_SITE_FPREM);
         return;
     }
 
@@ -508,7 +557,7 @@ pub unsafe fn fpu_fprem(ieee: bool) {
     let d = (exp0 - exp1).abs();
     if !intel_compatibility || d < F80::of_f64(f64::to_bits(64.0)) {
         let fprem_quotient = if ieee { (st0 / st1).round() } else { (st0 / st1).trunc() };
-        fpu_write_st(*fpu_stack_ptr as i32, st0 - st1 * fprem_quotient);
+        fpu_write_st_at(*fpu_stack_ptr as i32, st0 - st1 * fprem_quotient, X87_SITE_FPREM);
         let fprem_quotient = fprem_quotient.to_i32();
         *fpu_status_word &= !(FPU_C0 | FPU_C1 | FPU_C3);
         if 0 != fprem_quotient & 1 {
@@ -526,9 +575,10 @@ pub unsafe fn fpu_fprem(ieee: bool) {
         let n = F80::of_f64(f64::to_bits(32.0));
         let fprem_quotient =
             (if ieee { (st0 / st1).round() } else { (st0 / st1).trunc() } / (d - n).two_pow());
-        fpu_write_st(
+        fpu_write_st_at(
             *fpu_stack_ptr as i32,
             st0 - st1 * fprem_quotient * (d - n).two_pow(),
+            X87_SITE_FPREM,
         );
         *fpu_status_word |= FPU_C2;
     }
@@ -544,7 +594,7 @@ pub unsafe fn fpu_frstor32(mut addr: i32) {
     addr += 28;
     for i in 0..8 {
         let reg_index = *fpu_stack_ptr as i32 + i & 7;
-        *fpu_st.offset(reg_index as isize) = fpu_load_m80(addr).unwrap();
+        fpu_write_st_at(reg_index, fpu_load_m80(addr).unwrap(), X87_SITE_FRSTOR);
         addr += 10;
     }
 }
@@ -614,7 +664,7 @@ pub unsafe fn fpu_load_tag_word() -> i32 {
 #[no_mangle]
 pub unsafe fn fpu_fst(r: i32) {
     let index: i32 = *fpu_stack_ptr as i32 + r & 7;
-    fpu_write_st(index, fpu_get_st0());
+    fpu_write_st_at(index, fpu_get_st0(), X87_SITE_FST_STI);
     if 0 == ((*fpu_stack_empty >> *fpu_stack_ptr) & 1) {
         *fpu_stack_empty &= !(1 << index);
     }
@@ -781,8 +831,8 @@ pub unsafe fn fpu_fxam() {
 #[no_mangle]
 pub unsafe fn fpu_fxch(i: i32) {
     let sti = fpu_get_sti(i);
-    fpu_write_st(*fpu_stack_ptr as i32 + i & 7, fpu_get_st0());
-    fpu_write_st(*fpu_stack_ptr as i32, sti);
+    fpu_write_st_at(*fpu_stack_ptr as i32 + i & 7, fpu_get_st0(), X87_SITE_FXCH);
+    fpu_write_st_at(*fpu_stack_ptr as i32, sti, X87_SITE_FXCH);
 }
 pub unsafe fn fpu_fyl2x() {
     let st0 = fpu_get_st0();
@@ -792,9 +842,10 @@ pub unsafe fn fpu_fyl2x() {
     else if st0 == F80::ZERO {
         fpu_zero_fault();
     }
-    fpu_write_st(
+    fpu_write_st_at(
         *fpu_stack_ptr as i32 + 1 & 7,
         fpu_get_sti(1) * st0.ln() / F80::LN_2,
+        X87_SITE_TRANSCENDENTAL,
     );
     fpu_pop();
 }
@@ -803,12 +854,16 @@ pub unsafe fn fpu_fxtract() {
     let st0 = fpu_get_st0();
     if st0 == F80::ZERO {
         fpu_zero_fault();
-        fpu_write_st(*fpu_stack_ptr as i32, F80::NEG_INFINITY);
+        fpu_write_st_at(*fpu_stack_ptr as i32, F80::NEG_INFINITY, X87_SITE_TRANSCENDENTAL);
         fpu_push(st0);
     }
     else {
         let exp = st0.exponent();
-        fpu_write_st(*fpu_stack_ptr as i32, F80::of_i32(exp.into()));
+        fpu_write_st_at(
+            *fpu_stack_ptr as i32,
+            F80::of_i32(exp.into()),
+            X87_SITE_TRANSCENDENTAL,
+        );
         fpu_push(F80 {
             sign_exponent: 0x3FFF,
             mantissa: st0.mantissa,
@@ -822,24 +877,24 @@ pub unsafe fn fwait() {
 
 pub unsafe fn fpu_fchs() {
     let st0 = fpu_get_st0();
-    fpu_write_st(*fpu_stack_ptr as i32, -st0);
+    fpu_write_st_at(*fpu_stack_ptr as i32, -st0, X87_SITE_SIGN);
 }
 
 pub unsafe fn fpu_fabs() {
     let st0 = fpu_get_st0();
-    fpu_write_st(*fpu_stack_ptr as i32, st0.abs());
+    fpu_write_st_at(*fpu_stack_ptr as i32, st0.abs(), X87_SITE_SIGN);
 }
 
 pub unsafe fn fpu_f2xm1() {
     let st0 = fpu_get_st0();
     let r = st0.two_pow() - F80::ONE;
-    fpu_write_st(*fpu_stack_ptr as i32, r)
+    fpu_write_st_at(*fpu_stack_ptr as i32, r, X87_SITE_TRANSCENDENTAL)
 }
 
 pub unsafe fn fpu_fptan() {
     let st0 = fpu_get_st0();
     //if -pow(2.0, 63.0) < st0 && st0 < pow(2.0, 63.0) {
-    fpu_write_st(*fpu_stack_ptr as i32, st0.tan());
+    fpu_write_st_at(*fpu_stack_ptr as i32, st0.tan(), X87_SITE_TRANSCENDENTAL);
     // no bug: push constant 1
     fpu_push(F80::ONE);
     *fpu_status_word &= !FPU_C2;
@@ -852,7 +907,7 @@ pub unsafe fn fpu_fptan() {
 pub unsafe fn fpu_fpatan() {
     let st0 = fpu_get_st0();
     let st1 = fpu_get_sti(1);
-    fpu_write_st(*fpu_stack_ptr as i32 + 1 & 7, st1.atan2(st0));
+    fpu_write_st_at(*fpu_stack_ptr as i32 + 1 & 7, st1.atan2(st0), X87_SITE_TRANSCENDENTAL);
     fpu_pop();
 }
 
@@ -861,7 +916,7 @@ pub unsafe fn fpu_fyl2xp1() {
     let st0 = fpu_get_st0();
     let st1 = fpu_get_sti(1);
     let y = st1 * (st0 + F80::ONE).ln() / F80::LN_2;
-    fpu_write_st(*fpu_stack_ptr as i32 + 1 & 7, y);
+    fpu_write_st_at(*fpu_stack_ptr as i32 + 1 & 7, y, X87_SITE_TRANSCENDENTAL);
     fpu_pop();
 }
 
@@ -870,13 +925,13 @@ pub unsafe fn fpu_fsqrt() {
     //if st0 < 0.0 {
     //    fpu_invalid_arithmetic();
     //}
-    fpu_write_st(*fpu_stack_ptr as i32, st0.sqrt())
+    fpu_write_st_at(*fpu_stack_ptr as i32, st0.sqrt(), X87_SITE_FSQRT)
 }
 
 pub unsafe fn fpu_fsincos() {
     let st0 = fpu_get_st0();
     //if pow(-2.0, 63.0) < st0 && st0 < pow(2.0, 63.0) {
-    fpu_write_st(*fpu_stack_ptr as i32, st0.sin());
+    fpu_write_st_at(*fpu_stack_ptr as i32, st0.sin(), X87_SITE_TRANSCENDENTAL);
     fpu_push(st0.cos());
     *fpu_status_word &= !FPU_C2;
     //}
@@ -887,19 +942,19 @@ pub unsafe fn fpu_fsincos() {
 
 pub unsafe fn fpu_frndint() {
     let st0 = fpu_get_st0();
-    fpu_write_st(*fpu_stack_ptr as i32, st0.round());
+    fpu_write_st_at(*fpu_stack_ptr as i32, st0.round(), X87_SITE_FRNDINT);
 }
 
 pub unsafe fn fpu_fscale() {
     let st0 = fpu_get_st0();
     let y = st0 * fpu_get_sti(1).trunc().two_pow();
-    fpu_write_st(*fpu_stack_ptr as i32, y);
+    fpu_write_st_at(*fpu_stack_ptr as i32, y, X87_SITE_FSCALE);
 }
 
 pub unsafe fn fpu_fsin() {
     let st0 = fpu_get_st0();
     //if pow(-2.0, 63.0) < st0 && st0 < pow(2.0, 63.0) {
-    fpu_write_st(*fpu_stack_ptr as i32, st0.sin());
+    fpu_write_st_at(*fpu_stack_ptr as i32, st0.sin(), X87_SITE_TRANSCENDENTAL);
     *fpu_status_word &= !FPU_C2;
     //}
     //else {
@@ -910,7 +965,7 @@ pub unsafe fn fpu_fsin() {
 pub unsafe fn fpu_fcos() {
     let st0 = fpu_get_st0();
     //if pow(-2.0, 63.0) < st0 && st0 < pow(2.0, 63.0) {
-    fpu_write_st(*fpu_stack_ptr as i32, st0.cos());
+    fpu_write_st_at(*fpu_stack_ptr as i32, st0.cos(), X87_SITE_TRANSCENDENTAL);
     *fpu_status_word &= !FPU_C2;
     //}
     //else {
