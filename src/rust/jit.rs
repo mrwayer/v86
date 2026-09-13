@@ -2682,6 +2682,7 @@ pub fn jit_increase_hotness_and_maybe_compile(
     *hotness += heat;
     if *hotness >= unsafe { JIT_THRESHOLD } {
         if is_compiling {
+            unsafe { cpu::note_stat(cpu::STAT_INTERP_COMPILE_DEFERRED, 1) };
             return;
         }
         // only try generating if we're in the correct address space
@@ -2690,8 +2691,13 @@ pub fn jit_increase_hotness_and_maybe_compile(
             jit_analyze_and_generate(&mut ctx, virt_address, phys_address, cs_offset, state_flags)
         }
         else {
+            unsafe { cpu::note_stat(cpu::STAT_INTERP_COMPILE_DEFERRED, 1) };
             profiler::stat_increment(stat::COMPILE_WRONG_ADDRESS_SPACE);
         }
+    }
+    else {
+        // The page is on its way: what interpreting it costs now buys a module.
+        unsafe { cpu::note_stat(cpu::STAT_INTERP_BELOW_THRESHOLD, 1) };
     }
 }
 

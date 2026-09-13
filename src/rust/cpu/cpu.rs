@@ -315,11 +315,52 @@ pub const LOOP_COUNTER: i32 = 100_003;
 ///     instruction's bytes, which kept the code and the page's hotness
 /// 14: x87 operations that fell to their helper because a register they read
 ///     no longer held a tagged double
-pub const STAT_COUNT: usize = 15;
+/// 15-18: why the interpreter ran, one per dispatch and so a partition of
+///     slot 3: 15 no compiled code for the page at all, 16 the page has code
+///     for this state but no entry at this address, 17 the same within an
+///     instruction's reach of the page's end, 18 the page has code compiled
+///     for a different state
+/// 19-22: the instructions each of those four interpreted
+/// 23: page walks that turned up the entry the look before them missed, so
+///     nothing was interpreted -- not part of the partition above
+/// 24: dispatches whose page is still under the compile threshold
+/// 25: dispatches whose page had the heat and got no module anyway
+pub const STAT_COUNT: usize = 26;
 pub static mut STATS: [u64; STAT_COUNT] = [0; STAT_COUNT];
 
 /// An x87 operation that had an inline arm took its helper arm instead.
 pub const STAT_X87_TAG_LOST: usize = 14;
+
+/// Why the interpreter ran, as a partition of the dispatches at slot 3.
+///
+/// A release build counted interpreted steps and dispatches and nothing more:
+/// every reason the emulator had for not entering generated code was a
+/// profiler counter, compiled out of the build that runs. A capture could then
+/// say that half a frame's stall went outside compiled code but not why, which
+/// is the difference between a finding and a guess. These four are decided
+/// where the decision is made already and committed once per dispatch, so they
+/// sum to the dispatch count; the steps each of them interpreted come from the
+/// difference the dispatch computes anyway.
+pub const STAT_INTERP_REASON: usize = 15;
+pub const STAT_INTERP_REASON_STEPS: usize = 19;
+pub const INTERP_NO_CODE: usize = 0;
+pub const INTERP_PAGE_HAS_CODE: usize = 1;
+pub const INTERP_NEAR_END_OF_PAGE: usize = 2;
+pub const INTERP_DIFFERENT_STATE: usize = 3;
+
+/// A dispatch that did not happen: the page walk the interpreted path makes
+/// first turned up an entry the look before it missed, and the next turn goes
+/// into generated code. Deliberately outside the partition above, which counts
+/// only dispatches that ran.
+pub const STAT_INTERP_ENTRY_AFTER_PAGE_WALK: usize = 23;
+
+/// Of the dispatches, the ones whose page is on its way to being compiled, and
+/// the ones whose page had the heat for it and got nothing: the compiler was
+/// busy with another page, or the address space had moved under the eip. Both
+/// are counted where the page's hotness is in hand already, and so only while
+/// the compiler is on.
+pub const STAT_INTERP_BELOW_THRESHOLD: usize = 24;
+pub const STAT_INTERP_COMPILE_DEFERRED: usize = 25;
 
 /// Where an x87 value stops being a tagged double, named rather than only
 /// counted.
@@ -428,6 +469,57 @@ pub unsafe fn bottlify_dirty_page(index: u32) -> u32 {
 #[no_mangle]
 pub unsafe fn bottlify_dirty_count(index: u32) -> f64 {
     if (index as usize) < DIRTY_PAGES_KEPT { DIRTY_COUNTS[index as usize] as f64 } else { -1.0 }
+}
+
+/// Where the interpreter was entered most, weighted by what it interpreted
+/// there, so a report can name the code and not only the reason.
+///
+/// Keyed by the virtual page of the eip a dispatch started at, which is the key
+/// the by-address account uses too, with a bit per reason seen at that page: a
+/// page interpreted for one reason is a different finding from a page
+/// interpreted for two. Sixteen slots, the least-interpreted one given up to a
+/// page not in the table, so a page interpreted steadily holds its slot.
+pub const INTERP_PAGES_KEPT: usize = 16;
+pub static mut INTERP_PAGES: [u32; INTERP_PAGES_KEPT] = [0; INTERP_PAGES_KEPT];
+pub static mut INTERP_STEPS: [u64; INTERP_PAGES_KEPT] = [0; INTERP_PAGES_KEPT];
+pub static mut INTERP_REASONS: [u32; INTERP_PAGES_KEPT] = [0; INTERP_PAGES_KEPT];
+
+pub unsafe fn note_interp_page(page: u32, steps: u64, reason: usize) {
+    // A dispatch that faulted before its instructions were counted would
+    // otherwise hold a slot that reads as free.
+    let steps = steps.max(1);
+    let mut least = 0;
+    for i in 0..INTERP_PAGES_KEPT {
+        if INTERP_STEPS[i] != 0 && INTERP_PAGES[i] == page {
+            INTERP_STEPS[i] = INTERP_STEPS[i].wrapping_add(steps);
+            INTERP_REASONS[i] |= 1 << reason;
+            return;
+        }
+        if INTERP_STEPS[i] < INTERP_STEPS[least] {
+            least = i;
+        }
+    }
+    INTERP_PAGES[least] = page;
+    INTERP_STEPS[least] = steps;
+    INTERP_REASONS[least] = 1 << reason;
+}
+
+#[no_mangle]
+pub unsafe fn bottlify_interp_page(index: u32) -> u32 {
+    if (index as usize) < INTERP_PAGES_KEPT { INTERP_PAGES[index as usize] } else { 0 }
+}
+#[no_mangle]
+pub unsafe fn bottlify_interp_steps(index: u32) -> f64 {
+    if (index as usize) < INTERP_PAGES_KEPT {
+        INTERP_STEPS[index as usize] as f64
+    }
+    else {
+        -1.0
+    }
+}
+#[no_mangle]
+pub unsafe fn bottlify_interp_reasons(index: u32) -> u32 {
+    if (index as usize) < INTERP_PAGES_KEPT { INTERP_REASONS[index as usize] } else { 0 }
 }
 
 #[inline(always)]
@@ -3297,6 +3389,11 @@ pub unsafe fn cycle_internal() {
     let mut jit_entry = None;
     let initial_eip = *instruction_pointer;
     let initial_state_flags = *state_flags;
+    // Why generated code is not entered, decided here and counted at the
+    // dispatch below: in between, the page walk may turn up the entry this
+    // look is missing, and a reason counted before that is a reason for
+    // nothing.
+    let mut interp_reason = INTERP_NO_CODE;
 
     match tlb_code[(initial_eip as u32 >> 12) as usize] {
         None => {},
@@ -3309,7 +3406,13 @@ pub unsafe fn cycle_internal() {
                     jit_entry = Some((c.wasm_table_index.to_u16(), state));
                 }
                 else {
-                    profiler::stat_increment(if is_near_end_of_page(initial_eip as u32) {
+                    interp_reason = if is_near_end_of_page(initial_eip as u32) {
+                        INTERP_NEAR_END_OF_PAGE
+                    }
+                    else {
+                        INTERP_PAGE_HAS_CODE
+                    };
+                    profiler::stat_increment(if interp_reason == INTERP_NEAR_END_OF_PAGE {
                         stat::RUN_INTERPRETED_NEAR_END_OF_PAGE
                     }
                     else {
@@ -3318,6 +3421,7 @@ pub unsafe fn cycle_internal() {
                 }
             }
             else {
+                interp_reason = INTERP_DIFFERENT_STATE;
                 profiler::stat_increment(stat::RUN_INTERPRETED_DIFFERENT_STATE);
                 let s = *state_flags;
                 if c.state_flags.cpl3() != s.cpl3() {
@@ -3412,6 +3516,7 @@ pub unsafe fn cycle_internal() {
                 if initial_state_flags == c.state_flags
                     && c.state_table[initial_eip as usize & 0xFFF] != u16::MAX
                 {
+                    note_stat(STAT_INTERP_ENTRY_AFTER_PAGE_WALK, 1);
                     profiler::stat_increment(stat::RUN_INTERPRETED_PAGE_HAS_ENTRY_AFTER_PAGE_WALK);
                     return;
                 }
@@ -3427,8 +3532,12 @@ pub unsafe fn cycle_internal() {
 
         let initial_instruction_counter = *instruction_counter;
         jit_run_interpreted(phys_addr);
-        note_stat(1, (*instruction_counter).wrapping_sub(initial_instruction_counter) as u64);
+        let steps = (*instruction_counter).wrapping_sub(initial_instruction_counter) as u64;
+        note_stat(1, steps);
         note_stat(3, 1);
+        note_stat(STAT_INTERP_REASON + interp_reason, 1);
+        note_stat(STAT_INTERP_REASON_STEPS + interp_reason, steps);
+        note_interp_page(initial_eip as u32 >> 12, steps, interp_reason);
 
         jit::jit_increase_hotness_and_maybe_compile(
             initial_eip,
