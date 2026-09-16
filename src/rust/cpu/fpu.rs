@@ -86,9 +86,11 @@ pub fn fpu_canonical(x: F80) -> F80 {
 // reported it and a value no double holds goes through the library.
 
 /// The register at `index` as the double it holds, or nothing when it is
-/// empty or in the 80-bit format.
+/// empty or in the 80-bit format -- or when configuration index 7 is off,
+/// so that one switch is the control run for interpreted code as it is for
+/// compiled.
 unsafe fn fpu_tagged(index: i32) -> Option<f64> {
-    if 0 != *fpu_stack_empty >> index & 1 {
+    if !crate::jit::fpu_inline_enabled() || 0 != *fpu_stack_empty >> index & 1 {
         return None;
     }
     let r = *fpu_st.offset(index as isize);
@@ -674,11 +676,21 @@ pub unsafe fn fpu_set_status_word(sw: u16) {
 
 pub unsafe fn fpu_fldm32(addr: i32) {
     let bits = return_on_pagefault!(safe_read32s(addr));
-    fpu_push_f64(f32::from_bits(bits as u32) as f64, X87_SITE_FLD_M32)
+    if crate::jit::fpu_inline_enabled() {
+        fpu_push_f64(f32::from_bits(bits as u32) as f64, X87_SITE_FLD_M32)
+    }
+    else {
+        fpu_push_at(f32_to_f80(bits), X87_SITE_FLD_M32)
+    }
 }
 pub unsafe fn fpu_fldm64(addr: i32) {
     let bits = return_on_pagefault!(safe_read64s(addr));
-    fpu_push_f64(f64::from_bits(bits), X87_SITE_FLD_M64)
+    if crate::jit::fpu_inline_enabled() {
+        fpu_push_f64(f64::from_bits(bits), X87_SITE_FLD_M64)
+    }
+    else {
+        fpu_push_at(f64_to_f80(bits), X87_SITE_FLD_M64)
+    }
 }
 pub unsafe fn fpu_fldm80(addr: i32) {
     fpu_push_at(return_on_pagefault!(fpu_load_m80(addr)), X87_SITE_FLD_M80)
