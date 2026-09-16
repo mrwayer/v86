@@ -3,8 +3,10 @@
 ; register in each of its three encodings, the stores, and the compares. Every
 ; value is exact in a double, so the result does not depend on the precision
 ; the arithmetic runs at, and the same file checks the interpreter and the
-; compiler against one hardware fixture. The last two cases are the ones the
-; arm must decline: a value no double holds, and an empty register.
+; compiler against one hardware fixture. The last cases are the ones the arm
+; must decline: a value no double holds, an empty register, and the operands
+; and results that raise a flag -- a divide by zero, an invalid operation, a
+; NaN -- under each of the three encodings, so the status word is pinned too.
 
 global _start
 
@@ -27,6 +29,12 @@ global _start
     mov dword [esp+32], 0x00000001
     mov dword [esp+36], 0xc0000000
     mov word [esp+40], 0x3fff
+
+    mov dword [esp+44], 0x00000000        ; 0.0 as a single
+    mov dword [esp+48], 0x00000000        ; 0.0 as a double
+    mov dword [esp+52], 0x00000000
+    mov dword [esp+56], 0x00000000        ; a quiet NaN as a double
+    mov dword [esp+60], 0x7ff80000
 
     ; arithmetic against a single in memory
     fld dword [esp]                       ; 1.5
@@ -159,5 +167,79 @@ global _start
     fnstsw ax
     mov [esp+172], eax
     fstp st0
+
+    ; the flags: x/0 raises a zero divide, 0/0 an invalid operation, a NaN
+    ; operand nothing at all but its own propagation. Each case starts with
+    ; the flags clear and stores what it left.
+    fnclex
+    fld dword [esp]                       ; 1.5
+    fdiv dword [esp+44]                   ; / 0.0 single
+    xor eax, eax
+    fnstsw ax
+    mov [esp+176], eax
+    fstp dword [esp+180]
+    fnclex
+    fld dword [esp+44]                    ; 0.0
+    fdiv dword [esp+44]                   ; 0/0
+    xor eax, eax
+    fnstsw ax
+    mov [esp+184], eax
+    fstp dword [esp+188]
+    fnclex
+    fld dword [esp]                       ; 1.5
+    fadd dword [esp+12]                   ; + NaN
+    xor eax, eax
+    fnstsw ax
+    mov [esp+192], eax
+    fstp dword [esp+196]
+
+    fnclex
+    fld qword [esp+24]                    ; 1.5
+    fdiv qword [esp+48]                   ; / 0.0 double
+    xor eax, eax
+    fnstsw ax
+    mov [esp+200], eax
+    fstp dword [esp+204]
+    fnclex
+    fld qword [esp+48]                    ; 0.0
+    fdiv qword [esp+48]                   ; 0/0
+    xor eax, eax
+    fnstsw ax
+    mov [esp+208], eax
+    fstp dword [esp+212]
+    fnclex
+    fld qword [esp+56]                    ; NaN
+    fmul qword [esp+24]                   ; * 1.5
+    xor eax, eax
+    fnstsw ax
+    mov [esp+216], eax
+    fstp dword [esp+220]
+
+    fnclex
+    fld dword [esp+44]                    ; 0.0
+    fld dword [esp]                       ; st0 1.5, st1 0.0
+    fdiv st0, st1                         ; 1.5 / 0.0
+    xor eax, eax
+    fnstsw ax
+    mov [esp+224], eax
+    fstp dword [esp+228]
+    fstp st0
+    fnclex
+    fld dword [esp+44]                    ; 0.0
+    fld dword [esp+44]                    ; st0 0.0, st1 0.0
+    fdivp st1, st0                        ; 0/0, popped
+    xor eax, eax
+    fnstsw ax
+    mov [esp+232], eax
+    fstp dword [esp+236]
+    fnclex
+    fld dword [esp+12]                    ; NaN
+    fld dword [esp]                       ; st0 1.5, st1 NaN
+    fsub st1, st0                         ; NaN - 1.5
+    xor eax, eax
+    fnstsw ax
+    mov [esp+240], eax
+    fstp st0
+    fstp dword [esp+244]
 
 %include "footer.inc"

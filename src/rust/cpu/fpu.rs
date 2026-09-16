@@ -79,19 +79,11 @@ pub fn fpu_canonical(x: F80) -> F80 {
     }
 }
 
-// The interpreter's arms of the forms generated code emits inline.
-//
-// Generated code reads a register that carries the tag as the double it holds
-// and writes its result tagged; a helper canonicalises every operand through
-// the 80-bit format and tests every result for a double form again. So the
-// same instruction made three conversions interpreted and none compiled, and
-// a conversion count taken while the interpreter ran -- a view held under the
-// exact account, whose start clears the compiled cache -- read as a property
-// of the compiled code. These arms do what the inline forms do, on the same
-// condition, every register read full and tagged; anything else takes the
-// helper the form always took, so a stack fault is reported where the
-// interpreter reported it. An instruction then yields the same value whichever
-// way it ran, at the precision the inline path already runs at.
+// The interpreter's arms of the forms generated code emits inline: every
+// register read full and tagged, the operation done in doubles, the result
+// written tagged, no conversion in between. Anything else takes the helper
+// the form always took, so a stack fault is reported where the interpreter
+// reported it and a value no double holds goes through the library.
 
 /// The register at `index` as the double it holds, or nothing when it is
 /// empty or in the 80-bit format.
@@ -136,6 +128,12 @@ pub enum FpuOp {
     DivR,
 }
 
+/// What an arm may compute on and produce: a normal or a zero, which is what
+/// the helper's own shortcut accepts. Everything else -- a NaN, an infinity,
+/// a denormal, a result that overflowed or underflowed -- raises a flag the
+/// library sets and the arm would not, so such an instruction is the helper's.
+fn fpu_arm_ok(x: f64) -> bool { x.is_normal() || x == 0.0 }
+
 fn fpu_apply(op: FpuOp, st0: f64, other: f64) -> f64 {
     match op {
         FpuOp::Add => st0 + other,
@@ -162,12 +160,12 @@ unsafe fn fpu_op_by_helper(op: FpuOp, target: i32, val: F80) {
 pub unsafe fn fpu_op_m32(addr: i32, op: FpuOp) {
     let bits = return_on_pagefault!(safe_read32s(addr));
     let top = *fpu_stack_ptr as i32;
-    match fpu_tagged(top) {
-        Some(st0) => {
-            let other = f32::from_bits(bits as u32) as f64;
-            fpu_write_tagged(top, fpu_apply(op, st0, other))
+    let other = f32::from_bits(bits as u32) as f64;
+    match fpu_tagged(top).map(|st0| (st0, fpu_apply(op, st0, other))) {
+        Some((st0, r)) if fpu_arm_ok(st0) && fpu_arm_ok(other) && fpu_arm_ok(r) => {
+            fpu_write_tagged(top, r)
         },
-        None => fpu_op_by_helper(op, 0, f32_to_f80(bits)),
+        _ => fpu_op_by_helper(op, 0, f32_to_f80(bits)),
     }
 }
 
@@ -175,9 +173,12 @@ pub unsafe fn fpu_op_m32(addr: i32, op: FpuOp) {
 pub unsafe fn fpu_op_m64(addr: i32, op: FpuOp) {
     let bits = return_on_pagefault!(safe_read64s(addr));
     let top = *fpu_stack_ptr as i32;
-    match fpu_tagged(top) {
-        Some(st0) => fpu_write_tagged(top, fpu_apply(op, st0, f64::from_bits(bits))),
-        None => fpu_op_by_helper(op, 0, f64_to_f80(bits)),
+    let other = f64::from_bits(bits);
+    match fpu_tagged(top).map(|st0| (st0, fpu_apply(op, st0, other))) {
+        Some((st0, r)) if fpu_arm_ok(st0) && fpu_arm_ok(other) && fpu_arm_ok(r) => {
+            fpu_write_tagged(top, r)
+        },
+        _ => fpu_op_by_helper(op, 0, f64_to_f80(bits)),
     }
 }
 
@@ -185,7 +186,15 @@ pub unsafe fn fpu_op_m64(addr: i32, op: FpuOp) {
 pub unsafe fn fpu_op_sti(i: i32, target: i32, op: FpuOp, pop: bool) {
     let top = *fpu_stack_ptr as i32;
     match (fpu_tagged(top), fpu_tagged(top + i & 7)) {
-        (Some(st0), Some(sti)) => fpu_write_tagged(top + target & 7, fpu_apply(op, st0, sti)),
+        (Some(st0), Some(sti)) if fpu_arm_ok(st0) && fpu_arm_ok(sti) => {
+            let r = fpu_apply(op, st0, sti);
+            if fpu_arm_ok(r) {
+                fpu_write_tagged(top + target & 7, r)
+            }
+            else {
+                fpu_op_by_helper(op, target, fpu_get_sti(i))
+            }
+        },
         _ => fpu_op_by_helper(op, target, fpu_get_sti(i)),
     }
     if pop {
@@ -836,14 +845,15 @@ pub unsafe fn fpu_fstcw(addr: i32) {
 
 pub unsafe fn fpu_fstm32(addr: i32) { return_on_pagefault!(fpu_store_st0_m32(addr)) }
 /// st(0) narrowed to a single: a tagged register as generated code narrows
-/// it, any other through the library.
+/// it, when that single is a normal or the zero of a zero; any other through
+/// the library, which is where an overflow or an underflow raises its flag.
 unsafe fn fpu_store_st0_m32(addr: i32) -> OrPageFault<()> {
-    match fpu_tagged(*fpu_stack_ptr as i32) {
-        Some(st0) => {
+    match fpu_tagged(*fpu_stack_ptr as i32).map(|st0| (st0, st0 as f32)) {
+        Some((st0, s)) if fpu_arm_ok(st0) && (st0 == 0.0 || s.is_normal()) => {
             note_x87_site(X87_SITE_INTERP_INLINE);
-            safe_write32(addr, (st0 as f32).to_bits() as i32)
+            safe_write32(addr, s.to_bits() as i32)
         },
-        None => fpu_store_m32(addr, fpu_get_st0()),
+        _ => fpu_store_m32(addr, fpu_get_st0()),
     }
 }
 pub unsafe fn fpu_store_m32(addr: i32, x: F80) -> OrPageFault<()> {
