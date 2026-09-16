@@ -62,6 +62,9 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber
           else
+            # A new tag is created on the default branch unless told where;
+            # a dispatch from a branch must point at the commit it built.
             gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" \
+              --target "$(git rev-parse HEAD)" \
               --title "v86 build $TAG" --notes "$NOTES"
           fi
