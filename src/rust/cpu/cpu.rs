@@ -325,8 +325,14 @@ pub const LOOP_COUNTER: i32 = 100_003;
 ///     nothing was interpreted -- not part of the partition above
 /// 24: dispatches whose page is still under the compile threshold
 /// 25: dispatches whose page had the heat and got no module anyway
-pub const STAT_COUNT: usize = 26;
+/// 26: x87 instructions retired inside generated code, 27: by the
+///     interpreter -- counted only while the by-address account is on, so
+///     that a frame's x87 share is a number and a player pays nothing for it
+pub const STAT_COUNT: usize = 28;
 pub static mut STATS: [u64; STAT_COUNT] = [0; STAT_COUNT];
+
+pub const STAT_X87_COMPILED: usize = 26;
+pub const STAT_X87_INTERPRETED: usize = 27;
 
 /// An x87 operation that had an inline arm took its helper arm instead.
 pub const STAT_X87_TAG_LOST: usize = 14;
@@ -3596,6 +3602,9 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32) {
             profile_hit(start_eip as u32, 1);
         }
         let opcode = *memory::mem8.offset(phys_addr as isize) as i32;
+        if PROFILE_ON && opcode & 0xF8 == 0xD8 {
+            note_stat(STAT_X87_INTERPRETED, 1);
+        }
         *instruction_pointer += 1;
         dbg_assert!(*prefixes == 0);
         run_instruction(opcode | (*is_32 as i32) << 8);

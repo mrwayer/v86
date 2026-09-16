@@ -6,6 +6,7 @@ use crate::cpu::cpu::{
     FLAGS_ALL, FLAGS_DEFAULT, FLAGS_MASK, FLAG_ADJUST, FLAG_CARRY, FLAG_DIRECTION, FLAG_INTERRUPT,
     FLAG_IOPL, FLAG_OVERFLOW, FLAG_SUB, FLAG_VM, FLAG_ZERO, OPSIZE_16, OPSIZE_32, OPSIZE_8,
 };
+use crate::cpu::cpu;
 use crate::cpu::global_pointers;
 use crate::gen;
 use crate::jit::{Instruction, InstructionOperand, InstructionOperandDest, JitContext};
@@ -76,19 +77,23 @@ fn local_to_instruction_operand(ctx: &mut JitContext, local: &WasmLocal) -> Inst
 pub fn jit_instruction(ctx: &mut JitContext, instr_flags: &mut u32) {
     ctx.cpu.prefixes = 0;
     ctx.start_of_current_instruction = ctx.cpu.eip;
-    gen::jit::jit(
-        ctx.cpu.read_imm8() as u32 | (ctx.cpu.osize_32() as u32) << 8,
-        ctx,
-        instr_flags,
-    );
+    jit_opcode(ctx, instr_flags);
 }
 
 pub fn jit_handle_prefix(ctx: &mut JitContext, instr_flags: &mut u32) {
-    gen::jit::jit(
-        ctx.cpu.read_imm8() as u32 | (ctx.cpu.osize_32() as u32) << 8,
-        ctx,
-        instr_flags,
-    );
+    jit_opcode(ctx, instr_flags);
+}
+
+fn jit_opcode(ctx: &mut JitContext, instr_flags: &mut u32) {
+    let opcode = ctx.cpu.read_imm8() as u32;
+    // Under the by-address account an x87 instruction counts itself as the
+    // block does, so the account can say what share of a frame they are.
+    // Decided when compiled, like the block's count, so code compiled with
+    // the account off carries nothing.
+    if unsafe { cpu::PROFILE_ON } && (0xD8..=0xDF).contains(&opcode) {
+        ctx.builder.increment_fixed_i64(cpu::stat_address(cpu::STAT_X87_COMPILED), 1);
+    }
+    gen::jit::jit(opcode | (ctx.cpu.osize_32() as u32) << 8, ctx, instr_flags);
 }
 
 pub fn jit_handle_segment_prefix(segment: u32, ctx: &mut JitContext, instr_flags: &mut u32) {
