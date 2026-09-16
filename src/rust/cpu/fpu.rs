@@ -79,6 +79,171 @@ pub fn fpu_canonical(x: F80) -> F80 {
     }
 }
 
+// The interpreter's arms of the forms generated code emits inline.
+//
+// Generated code reads a register that carries the tag as the double it holds
+// and writes its result tagged; a helper canonicalises every operand through
+// the 80-bit format and tests every result for a double form again. So the
+// same instruction made three conversions interpreted and none compiled, and
+// a conversion count taken while the interpreter ran -- a view held under the
+// exact account, whose start clears the compiled cache -- read as a property
+// of the compiled code. These arms do what the inline forms do, on the same
+// condition, every register read full and tagged; anything else takes the
+// helper the form always took, so a stack fault is reported where the
+// interpreter reported it. An instruction then yields the same value whichever
+// way it ran, at the precision the inline path already runs at.
+
+/// The register at `index` as the double it holds, or nothing when it is
+/// empty or in the 80-bit format.
+unsafe fn fpu_tagged(index: i32) -> Option<f64> {
+    if 0 != *fpu_stack_empty >> index & 1 {
+        return None;
+    }
+    let r = *fpu_st.offset(index as isize);
+    if r.sign_exponent == FPU_RELAXED_TAG { Some(f64::from_bits(r.mantissa)) } else { None }
+}
+
+unsafe fn fpu_write_tagged(index: i32, value: f64) {
+    note_x87_site(X87_SITE_INTERP_INLINE);
+    *fpu_st.offset(index as isize) = F80 {
+        mantissa: value.to_bits(),
+        sign_exponent: FPU_RELAXED_TAG,
+    };
+}
+
+/// Pushes a double tagged; a full slot is the fault `fpu_push_at` reports.
+unsafe fn fpu_push_f64(value: f64, site: usize) {
+    *fpu_stack_ptr = *fpu_stack_ptr - 1 & 7;
+    if 0 != *fpu_stack_empty >> *fpu_stack_ptr & 1 {
+        *fpu_status_word &= !FPU_C1;
+        *fpu_stack_empty &= !(1 << *fpu_stack_ptr);
+        fpu_write_tagged(*fpu_stack_ptr as i32, value);
+    }
+    else {
+        *fpu_status_word |= FPU_C1;
+        fpu_stack_fault();
+        fpu_write_st_at(*fpu_stack_ptr as i32, F80::INDEFINITE_NAN, site);
+    }
+}
+
+#[derive(Copy, Clone)]
+pub enum FpuOp {
+    Add,
+    Mul,
+    Sub,
+    SubR,
+    Div,
+    DivR,
+}
+
+fn fpu_apply(op: FpuOp, st0: f64, other: f64) -> f64 {
+    match op {
+        FpuOp::Add => st0 + other,
+        FpuOp::Mul => st0 * other,
+        FpuOp::Sub => st0 - other,
+        FpuOp::SubR => other - st0,
+        FpuOp::Div => st0 / other,
+        FpuOp::DivR => other / st0,
+    }
+}
+
+unsafe fn fpu_op_by_helper(op: FpuOp, target: i32, val: F80) {
+    match op {
+        FpuOp::Add => fpu_fadd(target, val),
+        FpuOp::Mul => fpu_fmul(target, val),
+        FpuOp::Sub => fpu_fsub(target, val),
+        FpuOp::SubR => fpu_fsubr(target, val),
+        FpuOp::Div => fpu_fdiv(target, val),
+        FpuOp::DivR => fpu_fdivr(target, val),
+    }
+}
+
+/// `op st(0), m32`
+pub unsafe fn fpu_op_m32(addr: i32, op: FpuOp) {
+    let bits = return_on_pagefault!(safe_read32s(addr));
+    let top = *fpu_stack_ptr as i32;
+    match fpu_tagged(top) {
+        Some(st0) => {
+            let other = f32::from_bits(bits as u32) as f64;
+            fpu_write_tagged(top, fpu_apply(op, st0, other))
+        },
+        None => fpu_op_by_helper(op, 0, f32_to_f80(bits)),
+    }
+}
+
+/// `op st(0), m64`
+pub unsafe fn fpu_op_m64(addr: i32, op: FpuOp) {
+    let bits = return_on_pagefault!(safe_read64s(addr));
+    let top = *fpu_stack_ptr as i32;
+    match fpu_tagged(top) {
+        Some(st0) => fpu_write_tagged(top, fpu_apply(op, st0, f64::from_bits(bits))),
+        None => fpu_op_by_helper(op, 0, f64_to_f80(bits)),
+    }
+}
+
+/// `op st(target), st(0) <op> st(i)`, and a pop for the `DE` forms.
+pub unsafe fn fpu_op_sti(i: i32, target: i32, op: FpuOp, pop: bool) {
+    let top = *fpu_stack_ptr as i32;
+    match (fpu_tagged(top), fpu_tagged(top + i & 7)) {
+        (Some(st0), Some(sti)) => fpu_write_tagged(top + target & 7, fpu_apply(op, st0, sti)),
+        _ => fpu_op_by_helper(op, target, fpu_get_sti(i)),
+    }
+    if pop {
+        fpu_pop();
+    }
+}
+
+/// The ordering of two doubles into C3, C2 and C0, as the inline compare
+/// deposits it: a NaN on either side is unordered, and for the signalling
+/// forms an invalid operation as well.
+unsafe fn fpu_cmp_f64(x: f64, y: f64, signals: bool) {
+    note_x87_site(X87_SITE_INTERP_INLINE);
+    *fpu_status_word &= !FPU_RESULT_FLAGS;
+    *fpu_status_word |= match x.partial_cmp(&y) {
+        Some(std::cmp::Ordering::Greater) => 0,
+        Some(std::cmp::Ordering::Less) => FPU_C0,
+        Some(std::cmp::Ordering::Equal) => FPU_C3,
+        None => FPU_C0 | FPU_C2 | FPU_C3 | if signals { FPU_EX_I } else { 0 },
+    };
+}
+
+/// `fcom m32` / `fcomp m32`
+pub unsafe fn fpu_fcom_m32(addr: i32, pop: bool) {
+    let bits = return_on_pagefault!(safe_read32s(addr));
+    match fpu_tagged(*fpu_stack_ptr as i32) {
+        Some(st0) => fpu_cmp_f64(st0, f32::from_bits(bits as u32) as f64, true),
+        None => fpu_fcom(f32_to_f80(bits)),
+    }
+    if pop {
+        fpu_pop();
+    }
+}
+
+/// `fcom m64` / `fcomp m64`
+pub unsafe fn fpu_fcom_m64(addr: i32, pop: bool) {
+    let bits = return_on_pagefault!(safe_read64s(addr));
+    match fpu_tagged(*fpu_stack_ptr as i32) {
+        Some(st0) => fpu_cmp_f64(st0, f64::from_bits(bits), true),
+        None => fpu_fcom(f64_to_f80(bits)),
+    }
+    if pop {
+        fpu_pop();
+    }
+}
+
+/// A compare against st(i), signalling or quiet, followed by `pops` pops.
+pub unsafe fn fpu_fcom_sti(i: i32, pops: u32, quiet: bool) {
+    let top = *fpu_stack_ptr as i32;
+    match (fpu_tagged(top), fpu_tagged(top + i & 7)) {
+        (Some(x), Some(y)) => fpu_cmp_f64(x, y, !quiet),
+        _ if quiet => fpu_fucom(i),
+        _ => fpu_fcom(fpu_get_sti(i)),
+    }
+    for _ in 0..pops {
+        fpu_pop();
+    }
+}
+
 pub unsafe fn fpu_get_st0() -> F80 {
     dbg_assert!(*fpu_stack_ptr < 8);
     if 0 != *fpu_stack_empty >> *fpu_stack_ptr & 1 {
@@ -185,18 +350,6 @@ pub unsafe fn fpu_load_i64(addr: i32) -> OrPageFault<F80> {
     Ok(F80::of_i64(v))
 }
 
-pub unsafe fn fpu_load_m32(addr: i32) -> OrPageFault<F80> {
-    F80::clear_exception_flags();
-    let v = F80::of_f32(safe_read32s(addr)?);
-    *fpu_status_word |= F80::get_exception_flags() as u16;
-    Ok(v)
-}
-pub unsafe fn fpu_load_m64(addr: i32) -> OrPageFault<F80> {
-    F80::clear_exception_flags();
-    let v = F80::of_f64(safe_read64s(addr)?);
-    *fpu_status_word |= F80::get_exception_flags() as u16;
-    Ok(v)
-}
 pub unsafe fn fpu_load_m80(addr: i32) -> OrPageFault<F80> {
     let mantissa = safe_read64s(addr)?;
     let sign_exponent = safe_read16(addr + 8)? as u16;
@@ -511,10 +664,12 @@ pub unsafe fn fpu_set_status_word(sw: u16) {
 }
 
 pub unsafe fn fpu_fldm32(addr: i32) {
-    fpu_push_at(return_on_pagefault!(fpu_load_m32(addr)), X87_SITE_FLD_M32)
+    let bits = return_on_pagefault!(safe_read32s(addr));
+    fpu_push_f64(f32::from_bits(bits as u32) as f64, X87_SITE_FLD_M32)
 }
 pub unsafe fn fpu_fldm64(addr: i32) {
-    fpu_push_at(return_on_pagefault!(fpu_load_m64(addr)), X87_SITE_FLD_M64)
+    let bits = return_on_pagefault!(safe_read64s(addr));
+    fpu_push_f64(f64::from_bits(bits), X87_SITE_FLD_M64)
 }
 pub unsafe fn fpu_fldm80(addr: i32) {
     fpu_push_at(return_on_pagefault!(fpu_load_m80(addr)), X87_SITE_FLD_M80)
@@ -679,8 +834,17 @@ pub unsafe fn fpu_fstcw(addr: i32) {
     return_on_pagefault!(safe_write16(addr, (*fpu_control_word).into()));
 }
 
-pub unsafe fn fpu_fstm32(addr: i32) {
-    return_on_pagefault!(fpu_store_m32(addr, fpu_get_st0()));
+pub unsafe fn fpu_fstm32(addr: i32) { return_on_pagefault!(fpu_store_st0_m32(addr)) }
+/// st(0) narrowed to a single: a tagged register as generated code narrows
+/// it, any other through the library.
+unsafe fn fpu_store_st0_m32(addr: i32) -> OrPageFault<()> {
+    match fpu_tagged(*fpu_stack_ptr as i32) {
+        Some(st0) => {
+            note_x87_site(X87_SITE_INTERP_INLINE);
+            safe_write32(addr, (st0 as f32).to_bits() as i32)
+        },
+        None => fpu_store_m32(addr, fpu_get_st0()),
+    }
 }
 pub unsafe fn fpu_store_m32(addr: i32, x: F80) -> OrPageFault<()> {
     F80::clear_exception_flags();
@@ -689,16 +853,23 @@ pub unsafe fn fpu_store_m32(addr: i32, x: F80) -> OrPageFault<()> {
     Ok(())
 }
 pub unsafe fn fpu_fstm32p(addr: i32) {
-    return_on_pagefault!(fpu_store_m32(addr, fpu_get_st0()));
+    return_on_pagefault!(fpu_store_st0_m32(addr));
     fpu_pop();
 }
-pub unsafe fn fpu_fstm64(addr: i32) {
-    return_on_pagefault!(fpu_store_m64(addr, fpu_get_st0()));
+pub unsafe fn fpu_fstm64(addr: i32) { return_on_pagefault!(fpu_store_st0_m64(addr)) }
+unsafe fn fpu_store_st0_m64(addr: i32) -> OrPageFault<()> {
+    match fpu_tagged(*fpu_stack_ptr as i32) {
+        Some(st0) => {
+            note_x87_site(X87_SITE_INTERP_INLINE);
+            safe_write64(addr, st0.to_bits())
+        },
+        None => fpu_store_m64(addr, fpu_get_st0()),
+    }
 }
 pub unsafe fn fpu_store_m64(addr: i32, x: F80) -> OrPageFault<()> { safe_write64(addr, x.to_f64()) }
 pub unsafe fn fpu_fstm64p(addr: i32) {
     // XXX: writable_or_pagefault before get_st0
-    return_on_pagefault!(fpu_store_m64(addr, fpu_get_st0()));
+    return_on_pagefault!(fpu_store_st0_m64(addr));
     fpu_pop();
 }
 #[no_mangle]

@@ -416,6 +416,10 @@ pub const X87_SITE_ARM_FCOM_STI: usize = 34;
 pub const X87_SITE_ARM_FCOM_MEM: usize = 35;
 pub const X87_SITE_ARM_STORE_INT: usize = 36;
 
+// The interpreter ran a form on tagged registers as generated code would have:
+// as the double, with no conversion in or out of the 80-bit format.
+pub const X87_SITE_INTERP_INLINE: usize = 37;
+
 #[inline(always)]
 pub unsafe fn note_x87_site(site: usize) {
     X87_SITES[site] = X87_SITES[site].wrapping_add(1);
