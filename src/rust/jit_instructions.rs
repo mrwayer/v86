@@ -3504,7 +3504,7 @@ fn gen_fpu_fcom_sti_helper(ctx: &mut JitContext, sti: u32, pops: u32, helper: &s
 }
 
 fn instr_group_D8_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, op: &str) {
-    codegen::gen_fpu_binop_m32(ctx, modrm_byte, 0, fpu_fast_op(op), op)
+    codegen::gen_fpu_binop_m32(ctx, modrm_byte, fpu_fast_op(op), op)
 }
 fn instr_group_D8_reg_jit(ctx: &mut JitContext, r: u32, op: &str) {
     codegen::gen_fpu_binop_sti(ctx, r, 0, fpu_fast_op(op), op)
@@ -3808,7 +3808,7 @@ pub fn instr_DB_6_reg_jit(ctx: &mut JitContext, r: u32) {
 }
 
 fn instr_group_DC_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, op: &str) {
-    codegen::gen_fpu_binop_m64(ctx, modrm_byte, 0, fpu_fast_op(op), op)
+    codegen::gen_fpu_binop_m64(ctx, modrm_byte, fpu_fast_op(op), op)
 }
 fn instr_group_DC_reg_jit(ctx: &mut JitContext, r: u32, op: &str) {
     codegen::gen_fpu_binop_sti(ctx, r, r, fpu_fast_op(op), op)
