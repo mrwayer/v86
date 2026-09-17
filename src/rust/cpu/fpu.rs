@@ -1145,9 +1145,57 @@ pub unsafe fn fpu_frndint() {
     fpu_write_st_at(*fpu_stack_ptr as i32, st0.round(), X87_SITE_FRNDINT);
 }
 
+/// `fscale`: st(0) scaled by two to the integer part of st(1).
+///
+/// A normal is scaled on its exponent field, so its mantissa is untouched
+/// whatever the precision control says -- the instruction is not one the
+/// control word rounds -- and the range is the format's own, to 2^16383,
+/// which a double the scale was once computed through does not reach.
+/// Everything else -- a zero, an infinity, a NaN, a denormal, or a result
+/// that leaves the exponent range -- is a multiply by a power of two the
+/// library carries out, in as many steps as its exponent range needs, so
+/// that the value, the overflow or underflow and the flags are the library's.
 pub unsafe fn fpu_fscale() {
     let st0 = fpu_get_st0();
-    let y = st0 * fpu_get_sti(1).trunc().two_pow();
+    let st1 = fpu_get_sti(1);
+    let n = f64::from_bits(st1.trunc().to_f64());
+    let exponent = (st0.sign_exponent & 0x7FFF) as i32;
+    let scaled = exponent as f64 + n;
+    let y = if exponent != 0
+        && exponent != 0x7FFF
+        && st0.mantissa >> 63 != 0
+        && n.is_finite()
+        && scaled >= 1.0
+        && scaled <= 0x7FFE as f64
+    {
+        F80 {
+            mantissa: st0.mantissa,
+            sign_exponent: st0.sign_exponent & 0x8000 | scaled as u16,
+        }
+    }
+    else if n.is_nan() {
+        st0 * st1
+    }
+    else if n.is_infinite() {
+        st0 * if n > 0.0 { F80::POS_INFINITY } else { F80::ZERO }
+    }
+    else {
+        // Three steps of 2^±16382 reach past the format from either end.
+        let mut y = st0;
+        let mut n = n.clamp(-3.0 * 16382.0, 3.0 * 16382.0) as i32;
+        loop {
+            let step = n.clamp(-16382, 16382);
+            y = y * F80 {
+                mantissa: 1 << 63,
+                sign_exponent: (0x3FFF + step) as u16,
+            };
+            n -= step;
+            if n == 0 {
+                break;
+            }
+        }
+        y
+    };
     fpu_write_st_at(*fpu_stack_ptr as i32, y, X87_SITE_FSCALE);
 }
 
