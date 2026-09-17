@@ -451,7 +451,7 @@ pub static mut JIT_CROSS_PAGE: bool = true;
 /// page is always there and an instruction reaching into it decodes as it
 /// lies. With paging on the next page may not be mapped, and a block stops
 /// short of the end of its page as it always did.
-fn pages_are_flat() -> bool {
+pub fn pages_are_flat() -> bool {
     unsafe { JIT_CROSS_PAGE && *global_pointers::cr & cpu::CR0_PG == 0 }
 }
 
