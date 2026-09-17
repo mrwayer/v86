@@ -367,6 +367,130 @@ fn sse_packed_f32_xmm_mem(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32, o
     gen_packed_f32(ctx, source, r, op)
 }
 
+// The scalar forms on the low lane of an xmm register, done where it lies:
+// the lane loaded, the operation, the lane stored, and the upper lanes not
+// touched, which is what the instruction leaves them.
+
+#[derive(Copy, Clone)]
+enum ScalarOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// What the source of a scalar form is: another register's low lane, or
+/// memory, read before anything is pushed.
+#[derive(Copy, Clone)]
+enum ScalarSource {
+    Xmm(u32),
+    Mem(ModrmByte),
+}
+
+fn gen_scalar_f32(ctx: &mut JitContext, source: ScalarSource, r: u32, op: ScalarOp) {
+    let dest = global_pointers::get_reg_xmm_offset(r);
+    let read = match source {
+        ScalarSource::Mem(modrm_byte) => {
+            codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+            Some(ctx.builder.set_new_local())
+        },
+        ScalarSource::Xmm(_) => None,
+    };
+    let push_source = |ctx: &mut JitContext| match (source, &read) {
+        (ScalarSource::Xmm(r1), _) => {
+            ctx.builder
+                .const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
+            ctx.builder.load_aligned_f32(0);
+        },
+        (ScalarSource::Mem(_), Some(local)) => {
+            ctx.builder.get_local(local);
+            ctx.builder.reinterpret_i32_as_f32();
+        },
+        (ScalarSource::Mem(_), None) => dbg_assert!(false),
+    };
+    ctx.builder.const_i32(dest as i32);
+    match op {
+        ScalarOp::Add | ScalarOp::Mul => {
+            push_source(ctx);
+            ctx.builder.const_i32(dest as i32);
+            ctx.builder.load_aligned_f32(0);
+            if matches!(op, ScalarOp::Add) {
+                ctx.builder.add_f32()
+            }
+            else {
+                ctx.builder.mul_f32()
+            }
+        },
+        ScalarOp::Sub | ScalarOp::Div => {
+            ctx.builder.const_i32(dest as i32);
+            ctx.builder.load_aligned_f32(0);
+            push_source(ctx);
+            if matches!(op, ScalarOp::Sub) {
+                ctx.builder.sub_f32()
+            }
+            else {
+                ctx.builder.div_f32()
+            }
+        },
+    }
+    ctx.builder.store_aligned_f32(0);
+    if let Some(local) = read {
+        ctx.builder.free_local(local);
+    }
+}
+
+fn gen_scalar_f64(ctx: &mut JitContext, source: ScalarSource, r: u32, op: ScalarOp) {
+    let dest = global_pointers::get_reg_xmm_offset(r);
+    let read = match source {
+        ScalarSource::Mem(modrm_byte) => {
+            codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+            Some(ctx.builder.set_new_local_i64())
+        },
+        ScalarSource::Xmm(_) => None,
+    };
+    let push_source = |ctx: &mut JitContext| match (source, &read) {
+        (ScalarSource::Xmm(r1), _) => {
+            ctx.builder
+                .const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
+            ctx.builder.load_aligned_f64(0);
+        },
+        (ScalarSource::Mem(_), Some(local)) => {
+            ctx.builder.get_local_i64(local);
+            ctx.builder.reinterpret_i64_as_f64();
+        },
+        (ScalarSource::Mem(_), None) => dbg_assert!(false),
+    };
+    ctx.builder.const_i32(dest as i32);
+    match op {
+        ScalarOp::Add | ScalarOp::Mul => {
+            push_source(ctx);
+            ctx.builder.const_i32(dest as i32);
+            ctx.builder.load_aligned_f64(0);
+            if matches!(op, ScalarOp::Add) {
+                ctx.builder.add_f64()
+            }
+            else {
+                ctx.builder.mul_f64()
+            }
+        },
+        ScalarOp::Sub | ScalarOp::Div => {
+            ctx.builder.const_i32(dest as i32);
+            ctx.builder.load_aligned_f64(0);
+            push_source(ctx);
+            if matches!(op, ScalarOp::Sub) {
+                ctx.builder.sub_f64()
+            }
+            else {
+                ctx.builder.div_f64()
+            }
+        },
+    }
+    ctx.builder.store_aligned_f64(0);
+    if let Some(local) = read {
+        ctx.builder.free_local_i64(local);
+    }
+}
+
 fn mmx_read64_mm_mem32(ctx: &mut JitContext, name: &str, modrm_byte: ModrmByte, r: u32) {
     codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
     ctx.builder.const_i32(r as i32);
@@ -6324,16 +6448,16 @@ pub fn instr_660F58_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660F58", r1, r2);
 }
 pub fn instr_F20F58_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read64_xmm_mem(ctx, "instr_F20F58", modrm_byte, r);
+    gen_scalar_f64(ctx, ScalarSource::Mem(modrm_byte), r, ScalarOp::Add)
 }
 pub fn instr_F20F58_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read64_xmm_xmm(ctx, "instr_F20F58", r1, r2);
+    gen_scalar_f64(ctx, ScalarSource::Xmm(r1), r2, ScalarOp::Add)
 }
 pub fn instr_F30F58_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read_f32_xmm_mem(ctx, "instr_F30F58", modrm_byte, r);
+    gen_scalar_f32(ctx, ScalarSource::Mem(modrm_byte), r, ScalarOp::Add)
 }
 pub fn instr_F30F58_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read_f32_xmm_xmm(ctx, "instr_F30F58", r1, r2);
+    gen_scalar_f32(ctx, ScalarSource::Xmm(r1), r2, ScalarOp::Add)
 }
 
 pub fn instr_0F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
@@ -6349,16 +6473,16 @@ pub fn instr_660F59_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660F59", r1, r2);
 }
 pub fn instr_F20F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read64_xmm_mem(ctx, "instr_F20F59", modrm_byte, r);
+    gen_scalar_f64(ctx, ScalarSource::Mem(modrm_byte), r, ScalarOp::Mul)
 }
 pub fn instr_F20F59_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read64_xmm_xmm(ctx, "instr_F20F59", r1, r2);
+    gen_scalar_f64(ctx, ScalarSource::Xmm(r1), r2, ScalarOp::Mul)
 }
 pub fn instr_F30F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read_f32_xmm_mem(ctx, "instr_F30F59", modrm_byte, r);
+    gen_scalar_f32(ctx, ScalarSource::Mem(modrm_byte), r, ScalarOp::Mul)
 }
 pub fn instr_F30F59_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read_f32_xmm_xmm(ctx, "instr_F30F59", r1, r2);
+    gen_scalar_f32(ctx, ScalarSource::Xmm(r1), r2, ScalarOp::Mul)
 }
 
 pub fn instr_0F5A_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
@@ -6418,16 +6542,16 @@ pub fn instr_660F5C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660F5C", r1, r2);
 }
 pub fn instr_F20F5C_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read64_xmm_mem(ctx, "instr_F20F5C", modrm_byte, r);
+    gen_scalar_f64(ctx, ScalarSource::Mem(modrm_byte), r, ScalarOp::Sub)
 }
 pub fn instr_F20F5C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read64_xmm_xmm(ctx, "instr_F20F5C", r1, r2);
+    gen_scalar_f64(ctx, ScalarSource::Xmm(r1), r2, ScalarOp::Sub)
 }
 pub fn instr_F30F5C_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read_f32_xmm_mem(ctx, "instr_F30F5C", modrm_byte, r);
+    gen_scalar_f32(ctx, ScalarSource::Mem(modrm_byte), r, ScalarOp::Sub)
 }
 pub fn instr_F30F5C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read_f32_xmm_xmm(ctx, "instr_F30F5C", r1, r2);
+    gen_scalar_f32(ctx, ScalarSource::Xmm(r1), r2, ScalarOp::Sub)
 }
 
 pub fn instr_0F5D_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
@@ -6468,16 +6592,16 @@ pub fn instr_660F5E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660F5E", r1, r2);
 }
 pub fn instr_F20F5E_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read64_xmm_mem(ctx, "instr_F20F5E", modrm_byte, r);
+    gen_scalar_f64(ctx, ScalarSource::Mem(modrm_byte), r, ScalarOp::Div)
 }
 pub fn instr_F20F5E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read64_xmm_xmm(ctx, "instr_F20F5E", r1, r2);
+    gen_scalar_f64(ctx, ScalarSource::Xmm(r1), r2, ScalarOp::Div)
 }
 pub fn instr_F30F5E_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read_f32_xmm_mem(ctx, "instr_F30F5E", modrm_byte, r);
+    gen_scalar_f32(ctx, ScalarSource::Mem(modrm_byte), r, ScalarOp::Div)
 }
 pub fn instr_F30F5E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read_f32_xmm_xmm(ctx, "instr_F30F5E", r1, r2);
+    gen_scalar_f32(ctx, ScalarSource::Xmm(r1), r2, ScalarOp::Div)
 }
 
 pub fn instr_0F5F_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
