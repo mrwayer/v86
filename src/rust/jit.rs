@@ -417,6 +417,12 @@ pub struct JitContext<'a> {
     pub cpu: &'a mut CpuContext,
     pub builder: &'a mut WasmBuilder,
     pub register_locals: &'a mut Vec<WasmLocal>,
+    /// The x87 stack top and empty mask, held in locals for the module's
+    /// lifetime as the general registers are: the inline x87 forms read and
+    /// move them here, and memory is brought up to date wherever the
+    /// registers are spilled and before any helper that touches the stack.
+    pub fpu_stack_ptr_local: WasmLocal,
+    pub fpu_stack_empty_local: WasmLocal,
     pub start_of_current_instruction: u32,
     pub exit_with_fault_label: Label,
     pub exit_label: Label,
@@ -1646,6 +1652,10 @@ fn jit_generate_module(
             builder.set_new_local()
         })
         .collect();
+    builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    let fpu_stack_ptr_local = builder.set_new_local();
+    builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+    let fpu_stack_empty_local = builder.set_new_local();
 
     builder.const_i32(0);
     let instruction_counter = builder.set_new_local();
@@ -1673,6 +1683,8 @@ fn jit_generate_module(
         cpu: &mut cpu,
         builder,
         register_locals: &mut register_locals,
+        fpu_stack_ptr_local,
+        fpu_stack_empty_local,
         start_of_current_instruction: 0,
         exit_with_fault_label,
         exit_label,
@@ -2519,6 +2531,10 @@ fn jit_generate_module(
     for local in ctx.register_locals.drain(..) {
         ctx.builder.free_local(local);
     }
+    ctx.builder
+        .free_local(ctx.fpu_stack_ptr_local.unsafe_clone());
+    ctx.builder
+        .free_local(ctx.fpu_stack_empty_local.unsafe_clone());
     ctx.builder
         .free_local(ctx.instruction_counter.unsafe_clone());
 
