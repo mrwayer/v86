@@ -48,17 +48,39 @@ jobs:
           key: ${{ runner.os }}-nasmtests
 
       - name: Run nasmtests
+        id: nasmtests
+        continue-on-error: true
         run: MAX_PARALLEL_TESTS=1 make nasmtests
 
       - name: Run nasmtests-force-jit
+        id: nasmtests_force_jit
+        continue-on-error: true
         run: MAX_PARALLEL_TESTS=1 make nasmtests-force-jit
 
       - name: Run rust-test
+        id: rust_test
+        continue-on-error: true
         run: make rust-test
 
       - name: Run jitpagingtests
+        id: jitpagingtests
+        continue-on-error: true
         run: make jitpagingtests
 
       - name: rustfmt check
-        run: make rustfmt
+        id: rustfmt
         continue-on-error: true
+        run: make rustfmt
+
+      # Every suite above runs whatever the ones before it did, so one red
+      # suite does not hide the others; this is where the job goes red.
+      - name: Suites verdict
+        if: >-
+          steps.nasmtests.outcome == 'failure' ||
+          steps.nasmtests_force_jit.outcome == 'failure' ||
+          steps.rust_test.outcome == 'failure' ||
+          steps.jitpagingtests.outcome == 'failure' ||
+          steps.rustfmt.outcome == 'failure'
+        run: |
+          echo "nasmtests=${{ steps.nasmtests.outcome }} nasmtests-force-jit=${{ steps.nasmtests_force_jit.outcome }} rust-test=${{ steps.rust_test.outcome }} jitpagingtests=${{ steps.jitpagingtests.outcome }} rustfmt=${{ steps.rustfmt.outcome }}"
+          exit 1
