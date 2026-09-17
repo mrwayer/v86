@@ -1,10 +1,10 @@
 use crate::cpu::cpu::{
     page_has_code, stat_address, tlb_data, x87_site_address, FLAG_CARRY, FLAG_OVERFLOW, FLAG_SIGN,
     FLAG_ZERO, OPSIZE_16, OPSIZE_32, OPSIZE_8, STAT_X87_TAG_LOST, TLB_GLOBAL, TLB_HAS_CODE,
-    TLB_NO_USER, TLB_READONLY, TLB_VALID, X87_SITE_ARM_BINOP_M32, X87_SITE_ARM_BINOP_M64,
-    X87_SITE_ARM_BINOP_STI, X87_SITE_ARM_FCOM_MEM, X87_SITE_ARM_FCOM_STI, X87_SITE_ARM_FLD_STI,
-    X87_SITE_ARM_FST_STI, X87_SITE_ARM_FSQRT, X87_SITE_ARM_FXCH, X87_SITE_ARM_SIGN,
-    X87_SITE_ARM_STORE_INT, X87_SITE_ARM_STORE_M32, X87_SITE_ARM_STORE_M64,
+    TLB_NO_USER, TLB_READONLY, TLB_VALID, X87_SITE_ARM_BINOP_INT, X87_SITE_ARM_BINOP_M32,
+    X87_SITE_ARM_BINOP_M64, X87_SITE_ARM_BINOP_STI, X87_SITE_ARM_FCOM_MEM, X87_SITE_ARM_FCOM_STI,
+    X87_SITE_ARM_FLD_STI, X87_SITE_ARM_FST_STI, X87_SITE_ARM_FSQRT, X87_SITE_ARM_FXCH,
+    X87_SITE_ARM_SIGN, X87_SITE_ARM_STORE_INT, X87_SITE_ARM_STORE_M32, X87_SITE_ARM_STORE_M64,
 };
 use crate::cpu::fpu::{FPU_C0, FPU_C2, FPU_C3, FPU_EX_I, FPU_RESULT_FLAGS};
 use crate::cpu::global_pointers;
@@ -3154,90 +3154,100 @@ fn gen_fpu_arm_result(ctx: &mut JitContext, target: &WasmLocal, done: Label) {
     ctx.builder.free_local_i64(result);
 }
 
-/// `op st(0), st(0) <op> m32`, inline when st(0) carries the tag, the memory
-/// operand is a normal or a zero, and so is the result: the same set
-/// `fpu_arm_ok` takes in the interpreter, so an SNaN/infinity/denormal
-/// operand or a result that overflowed or underflowed takes the helper arm,
-/// which raises what an inline double add, sub, mul or div cannot. The
-/// result goes back into the register whose tag was just read, so the tag
-/// is not written again.
-pub fn gen_fpu_binop_m32(
-    ctx: &mut JitContext,
-    modrm_byte: ModrmByte,
-    op: FpuFastBinOp,
-    helper: &str,
-) {
-    if !crate::jit::fpu_inline_enabled() {
-        ctx.builder.const_i32(0);
-        gen_fpu_load_m32(ctx, modrm_byte);
-        ctx.builder.call_fn3_i32_i64_i32(helper);
-        return;
-    }
-    let modrm_slow = modrm_byte.clone();
-    let done = ctx.builder.block_void();
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
-    gen_modrm_resolve_safe_read32(ctx, modrm_byte);
-    let bits = ctx.builder.set_new_local();
-    gen_fpu_tag_ok(ctx, &st0_addr);
-    gen_fpu_f32_bits_ok(ctx, &bits);
-    ctx.builder.and_i32();
-    ctx.builder.if_void();
-    gen_fpu_binop_operands(ctx, op, &st0_addr, &mut |ctx| {
-        ctx.builder.get_local(&bits);
-        ctx.builder.reinterpret_i32_as_f32();
-        ctx.builder.promote_f32_to_f64();
-    });
-    gen_fpu_apply_f64_binop(ctx, op);
-    gen_fpu_arm_result(ctx, &st0_addr, done);
-    ctx.builder.else_();
-    gen_note_tag_lost(ctx.builder, X87_SITE_ARM_BINOP_M32);
-    ctx.builder.block_end();
-    ctx.builder.free_local(st0_addr);
-    ctx.builder.free_local(bits);
-    ctx.builder.const_i32(0);
-    gen_fpu_load_m32(ctx, modrm_slow);
-    ctx.builder.call_fn3_i32_i64_i32(helper);
-    ctx.builder.block_end();
+/// The bits of an x87 memory operand, as read, in a local of the width the
+/// read has.
+enum FpuMemBits {
+    Narrow(WasmLocal),
+    Wide(WasmLocalI64),
 }
 
-/// `op st(0), st(0) <op> m64`, inline when st(0) carries the tag, the memory
-/// operand is a normal or a zero, and so is the result -- see
-/// `gen_fpu_binop_m32`. The result goes back into the register whose tag
-/// was just read, so the tag is not written again.
-pub fn gen_fpu_binop_m64(
+/// `op st(0), st(0) <op> mem`, for a single, a double, a half or a word in
+/// memory, inline when st(0) carries the tag, the memory operand is a normal
+/// or a zero, and so is the result: the same set `fpu_arm_ok` takes in the
+/// interpreter, so an SNaN/infinity/denormal operand or a result that
+/// overflowed or underflowed takes the helper arm, which raises what an
+/// inline double add, sub, mul or div cannot. An integer operand is exact
+/// in a double, so only the result is tested for it. The result goes back
+/// into the register whose tag was just read, so the tag is not written
+/// again.
+pub fn gen_fpu_binop_mem(
     ctx: &mut JitContext,
     modrm_byte: ModrmByte,
+    kind: FpuMemOperand,
     op: FpuFastBinOp,
     helper: &str,
 ) {
     if !crate::jit::fpu_inline_enabled() {
         ctx.builder.const_i32(0);
-        gen_fpu_load_m64(ctx, modrm_byte);
+        gen_fpu_load_mem_as_f80(ctx, modrm_byte, kind);
         ctx.builder.call_fn3_i32_i64_i32(helper);
         return;
     }
     let modrm_slow = modrm_byte.clone();
     let done = ctx.builder.block_void();
     let st0_addr = gen_fpu_st_addr(ctx, 0);
-    gen_modrm_resolve_safe_read64(ctx, modrm_byte);
-    let bits = ctx.builder.set_new_local_i64();
+    let bits = match kind {
+        FpuMemOperand::F32 | FpuMemOperand::I32 => {
+            gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+            FpuMemBits::Narrow(ctx.builder.set_new_local())
+        },
+        FpuMemOperand::F64 => {
+            gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+            FpuMemBits::Wide(ctx.builder.set_new_local_i64())
+        },
+        FpuMemOperand::I16 => {
+            gen_modrm_resolve_safe_read16(ctx, modrm_byte);
+            sign_extend_i16(ctx.builder);
+            FpuMemBits::Narrow(ctx.builder.set_new_local())
+        },
+    };
     gen_fpu_tag_ok(ctx, &st0_addr);
-    gen_fpu_f64_bits_ok(ctx, &bits);
-    ctx.builder.and_i32();
+    match (kind, &bits) {
+        (FpuMemOperand::F32, FpuMemBits::Narrow(bits)) => {
+            gen_fpu_f32_bits_ok(ctx, bits);
+            ctx.builder.and_i32();
+        },
+        (FpuMemOperand::F64, FpuMemBits::Wide(bits)) => {
+            gen_fpu_f64_bits_ok(ctx, bits);
+            ctx.builder.and_i32();
+        },
+        _ => {},
+    }
     ctx.builder.if_void();
-    gen_fpu_binop_operands(ctx, op, &st0_addr, &mut |ctx| {
-        ctx.builder.get_local_i64(&bits);
-        ctx.builder.reinterpret_i64_as_f64();
+    gen_fpu_binop_operands(ctx, op, &st0_addr, &mut |ctx| match (kind, &bits) {
+        (FpuMemOperand::F32, FpuMemBits::Narrow(bits)) => {
+            ctx.builder.get_local(bits);
+            ctx.builder.reinterpret_i32_as_f32();
+            ctx.builder.promote_f32_to_f64();
+        },
+        (_, FpuMemBits::Narrow(bits)) => {
+            ctx.builder.get_local(bits);
+            ctx.builder.convert_i32_to_f64();
+        },
+        (_, FpuMemBits::Wide(bits)) => {
+            ctx.builder.get_local_i64(bits);
+            ctx.builder.reinterpret_i64_as_f64();
+        },
     });
     gen_fpu_apply_f64_binop(ctx, op);
     gen_fpu_arm_result(ctx, &st0_addr, done);
     ctx.builder.else_();
-    gen_note_tag_lost(ctx.builder, X87_SITE_ARM_BINOP_M64);
+    gen_note_tag_lost(
+        ctx.builder,
+        match kind {
+            FpuMemOperand::F32 => X87_SITE_ARM_BINOP_M32,
+            FpuMemOperand::F64 => X87_SITE_ARM_BINOP_M64,
+            FpuMemOperand::I16 | FpuMemOperand::I32 => X87_SITE_ARM_BINOP_INT,
+        },
+    );
     ctx.builder.block_end();
     ctx.builder.free_local(st0_addr);
-    ctx.builder.free_local_i64(bits);
+    match bits {
+        FpuMemBits::Narrow(bits) => ctx.builder.free_local(bits),
+        FpuMemBits::Wide(bits) => ctx.builder.free_local_i64(bits),
+    }
     ctx.builder.const_i32(0);
-    gen_fpu_load_m64(ctx, modrm_slow);
+    gen_fpu_load_mem_as_f80(ctx, modrm_slow, kind);
     ctx.builder.call_fn3_i32_i64_i32(helper);
     ctx.builder.block_end();
 }
@@ -3247,7 +3257,7 @@ pub fn gen_fpu_binop_m64(
 /// `fpu_arm_ok` accepts, so the two operands need no separate check, but
 /// their result can still overflow or underflow (a divide by the zero
 /// `fpu_arm_ok` lets through, among others), and that result must not stay
-/// tagged untested -- see `gen_fpu_binop_m32`. The target is st(0) or
+/// tagged untested -- see `gen_fpu_binop_mem`. The target is st(0) or
 /// st(i), one of the two registers whose tag was just read, so the tag is
 /// not written again.
 pub fn gen_fpu_binop_sti(

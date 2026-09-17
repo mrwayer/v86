@@ -406,6 +406,7 @@ pub const X87_SITE_TRANSCENDENTAL: usize = 18;
 pub const X87_SITE_FRSTOR: usize = 19;
 pub const X87_SITE_FXRSTOR: usize = 20;
 pub const X87_SITE_MMX: usize = 21;
+pub const X87_SITE_ARM_BINOP_INT: usize = 22;
 
 // An inline form called its helper because a register it reads lost the tag.
 pub const X87_SITE_ARM_BINOP_M32: usize = 24;

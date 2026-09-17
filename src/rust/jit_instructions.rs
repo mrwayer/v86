@@ -3509,7 +3509,7 @@ fn gen_fpu_fcom_sti_helper(ctx: &mut JitContext, sti: u32, pops: u32, helper: &s
 }
 
 fn instr_group_D8_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, op: &str) {
-    codegen::gen_fpu_binop_m32(ctx, modrm_byte, fpu_fast_op(op), op)
+    codegen::gen_fpu_binop_mem(ctx, modrm_byte, FpuMemOperand::F32, fpu_fast_op(op), op)
 }
 fn instr_group_D8_reg_jit(ctx: &mut JitContext, r: u32, op: &str) {
     codegen::gen_fpu_binop_sti(ctx, r, 0, fpu_fast_op(op), op)
@@ -3729,9 +3729,7 @@ pub fn instr_DA_6_reg_jit(ctx: &mut JitContext, _r: u32) { codegen::gen_trigger_
 pub fn instr_DA_7_reg_jit(ctx: &mut JitContext, _r: u32) { codegen::gen_trigger_ud(ctx) }
 
 pub fn instr_group_DA_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, op: &str) {
-    ctx.builder.const_i32(0);
-    codegen::gen_fpu_load_i32(ctx, modrm_byte);
-    ctx.builder.call_fn3_i32_i64_i32(op)
+    codegen::gen_fpu_binop_mem(ctx, modrm_byte, FpuMemOperand::I32, fpu_fast_op(op), op)
 }
 pub fn instr_DA_0_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     instr_group_DA_mem_jit(ctx, modrm_byte, "fpu_fadd")
@@ -3813,7 +3811,7 @@ pub fn instr_DB_6_reg_jit(ctx: &mut JitContext, r: u32) {
 }
 
 fn instr_group_DC_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, op: &str) {
-    codegen::gen_fpu_binop_m64(ctx, modrm_byte, fpu_fast_op(op), op)
+    codegen::gen_fpu_binop_mem(ctx, modrm_byte, FpuMemOperand::F64, fpu_fast_op(op), op)
 }
 fn instr_group_DC_reg_jit(ctx: &mut JitContext, r: u32, op: &str) {
     codegen::gen_fpu_binop_sti(ctx, r, r, fpu_fast_op(op), op)
@@ -3935,9 +3933,7 @@ pub fn instr32_DD_5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 }
 
 fn instr_group_DE_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, op: &str) {
-    ctx.builder.const_i32(0);
-    codegen::gen_fpu_load_i16(ctx, modrm_byte);
-    ctx.builder.call_fn3_i32_i64_i32(op)
+    codegen::gen_fpu_binop_mem(ctx, modrm_byte, FpuMemOperand::I16, fpu_fast_op(op), op)
 }
 fn instr_group_DE_reg_jit(ctx: &mut JitContext, r: u32, op: &str) {
     codegen::gen_fpu_binop_sti(ctx, r, r, fpu_fast_op(op), op);
