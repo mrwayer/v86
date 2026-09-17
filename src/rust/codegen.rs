@@ -3443,6 +3443,7 @@ pub fn gen_fpu_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
     gen_modrm_resolve(ctx, modrm_byte);
     let address_local = ctx.builder.set_new_local();
     if crate::jit::fpu_inline_enabled() {
+        let done = ctx.builder.block_void();
         let st0_addr = gen_fpu_st_addr(ctx, 0);
         gen_fpu_tag_ok(ctx, &st0_addr);
         ctx.builder.if_void();
@@ -3450,17 +3451,27 @@ pub fn gen_fpu_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
         ctx.builder.demote_f64_to_f32();
         ctx.builder.reinterpret_f32_as_i32();
         let value_local = ctx.builder.set_new_local();
+        // A tagged double is a normal or a zero, but narrowing it to a
+        // single can still overflow to infinity or underflow to a single
+        // denormal or zero -- fpu_arm_ok never tested that, so the narrowed
+        // bits get their own check before the inline write, matching the
+        // interpreter's fpu_store_st0_m32.
+        gen_fpu_f32_bits_ok(ctx, &value_local);
+        ctx.builder.if_void();
         gen_safe_write32(ctx, &address_local, &value_local);
+        ctx.builder.br(done);
+        ctx.builder.block_end();
         ctx.builder.free_local(value_local);
         ctx.builder.else_();
         gen_note_tag_lost(ctx.builder, X87_SITE_ARM_STORE_M32);
+        ctx.builder.block_end();
+        ctx.builder.free_local(st0_addr);
         gen_fpu_get_sti(ctx, 0);
         ctx.builder.call_fn2_i64_i32_ret("f80_to_f32");
         let value_local = ctx.builder.set_new_local();
         gen_safe_write32(ctx, &address_local, &value_local);
         ctx.builder.free_local(value_local);
         ctx.builder.block_end();
-        ctx.builder.free_local(st0_addr);
     }
     else {
         gen_fpu_get_sti(ctx, 0);
