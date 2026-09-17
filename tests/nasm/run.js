@@ -407,6 +407,44 @@ else {
             throw new Error("Bad fixture length in test " + current_test.img_name);
         }
 
+        // The x87 state is compared whether or not the test ended in a fault:
+        // gdb dumps it at the signal, and the emulator raises an exception
+        // only after generated code has written its state back.
+        if(fpu_tag !== FPU_TAG_ALL_INVALID)
+        {
+            for(let i = 0; i < evaluated_fpu_regs.length; i++) {
+                if(expected_fpu_regs[i] !== "invalid" &&
+                        !float_equal(evaluated_fpu_regs[i], expected_fpu_regs[i])) {
+                    individual_failures.push({
+                        name: "st" + i,
+                        expected: expected_fpu_regs[i],
+                        actual: evaluated_fpu_regs[i],
+                    });
+                }
+            }
+
+            if(fpu_status !== evaluated_fpu_status)
+            {
+                individual_failures.push({
+                    name: "fpu status word",
+                    expected: fpu_status,
+                    actual: evaluated_fpu_status,
+                });
+            }
+        }
+        else
+        {
+            for(let i = 0; i < evaluated_mmxs.length; i++) {
+                if(evaluated_mmxs[i] !== expected_mmx_registers[i]) {
+                    individual_failures.push({
+                        name: "mm" + (i >> 1) + ".int32[" + (i & 1) + "]",
+                        expected: expected_mmx_registers[i],
+                        actual: evaluated_mmxs[i],
+                    });
+                }
+            }
+        }
+
         if(!current_test.fixture.exception)
         {
             for(let i = 0; i < cpu.reg32.length; i++) {
@@ -417,41 +455,6 @@ else {
                         expected: expected_reg32[i],
                         actual: reg,
                     });
-                }
-            }
-
-            if(fpu_tag !== FPU_TAG_ALL_INVALID)
-            {
-                for(let i = 0; i < evaluated_fpu_regs.length; i++) {
-                    if(expected_fpu_regs[i] !== "invalid" &&
-                            !float_equal(evaluated_fpu_regs[i], expected_fpu_regs[i])) {
-                        individual_failures.push({
-                            name: "st" + i,
-                            expected: expected_fpu_regs[i],
-                            actual: evaluated_fpu_regs[i],
-                        });
-                    }
-                }
-
-                if(fpu_status !== evaluated_fpu_status)
-                {
-                    individual_failures.push({
-                        name: "fpu status word",
-                        expected: fpu_status,
-                        actual: evaluated_fpu_status,
-                    });
-                }
-            }
-            else
-            {
-                for(let i = 0; i < evaluated_mmxs.length; i++) {
-                    if(evaluated_mmxs[i] !== expected_mmx_registers[i]) {
-                        individual_failures.push({
-                            name: "mm" + (i >> 1) + ".int32[" + (i & 1) + "]",
-                            expected: expected_mmx_registers[i],
-                            actual: evaluated_mmxs[i],
-                        });
-                    }
                 }
             }
 
