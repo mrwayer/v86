@@ -179,7 +179,11 @@ unsafe fn string_instruction(
                 phys_dst = addr;
                 skip_dirty_page = true;
             },
-            _ => {},
+            // lods and outs never write memory: no phys_dst is computed for them, so the
+            // dirty-range call below must not run with the resulting phys_dst == 0
+            Instruction::Lods | Instruction::Outs => {
+                skip_dirty_page = true;
+            },
         };
 
         match instruction {
