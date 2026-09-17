@@ -389,7 +389,7 @@ pub unsafe fn fpu_load_status_word() -> u16 {
 pub unsafe fn fpu_fadd(target_index: i32, val: F80) {
     F80::clear_exception_flags();
     let st0 = fpu_get_st0();
-    fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, st0 + val);
+    fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, st0.add_arith(val));
     *fpu_status_word |= F80::get_exception_flags() as u16;
 }
 pub unsafe fn fpu_fclex() { *fpu_status_word = 0; }
@@ -461,14 +461,14 @@ pub unsafe fn fpu_fcomp(val: F80) {
 pub unsafe fn fpu_fdiv(target_index: i32, val: F80) {
     F80::clear_exception_flags();
     let st0 = fpu_get_st0();
-    fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, st0 / val);
+    fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, st0.div_arith(val));
     *fpu_status_word |= F80::get_exception_flags() as u16;
 }
 #[no_mangle]
 pub unsafe fn fpu_fdivr(target_index: i32, val: F80) {
     F80::clear_exception_flags();
     let st0 = fpu_get_st0();
-    fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, val / st0);
+    fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, val.div_arith(st0));
     *fpu_status_word |= F80::get_exception_flags() as u16;
 }
 #[no_mangle]
@@ -722,7 +722,7 @@ pub unsafe fn fpu_fldm80_without_fault(addr: i32) {
 #[no_mangle]
 pub unsafe fn fpu_fmul(target_index: i32, val: F80) {
     let st0 = fpu_get_st0();
-    fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, st0 * val);
+    fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, st0.mul_arith(val));
 }
 pub unsafe fn fpu_fnstsw_mem(addr: i32) {
     return_on_pagefault!(safe_write16(addr, fpu_load_status_word().into()));
@@ -944,12 +944,12 @@ pub unsafe fn fpu_fbstp(addr: i32) {
 #[no_mangle]
 pub unsafe fn fpu_fsub(target_index: i32, val: F80) {
     let st0 = fpu_get_st0();
-    fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, st0 - val)
+    fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, st0.sub_arith(val))
 }
 #[no_mangle]
 pub unsafe fn fpu_fsubr(target_index: i32, val: F80) {
     let st0 = fpu_get_st0();
-    fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, val - st0)
+    fpu_write_st(*fpu_stack_ptr as i32 + target_index & 7, val.sub_arith(st0))
 }
 
 pub unsafe fn fpu_ftst() {

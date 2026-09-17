@@ -213,6 +213,23 @@ fn fast_binary(x: &F80, y: &F80, op: fn(f64, f64) -> f64) -> Option<F80> {
     if !unsafe { FAST_F80 } {
         return None;
     }
+    of_f64_fast(op(to_f64_fast(x)?, to_f64_fast(y)?))
+}
+
+/// The fast path for FADD/FSUB/FMUL/FDIV (and their reversed and popping
+/// forms), which precision control governs: as `fast_binary`, but narrowed
+/// to 24 bits when the control word asks for it and the narrowed value is a
+/// normal single or the zero of a zero -- nothing otherwise, so the caller
+/// redoes the instruction through the library, which rounds at the same
+/// precision with the format's full exponent range. `fast_binary` itself
+/// stays raw: every composer built from it (FPREM, FYL2X, FYL2XP1, FSCALE's
+/// fallback) computes its intermediate at 53 bits, since precision control
+/// does not govern those instructions.
+#[inline]
+fn fast_binary_arith(x: &F80, y: &F80, op: fn(f64, f64) -> f64) -> Option<F80> {
+    if !unsafe { FAST_F80 } {
+        return None;
+    }
     let r = op(to_f64_fast(x)?, to_f64_fast(y)?);
     of_f64_fast(if precision_single() { narrow_to_single(r)? } else { r })
 }
@@ -466,6 +483,48 @@ impl F80 {
         else {
             None
         }
+    }
+}
+
+impl F80 {
+    /// FADD/FIADD's result: `self + other`, rounded to the control word's
+    /// precision the way the instruction runs on hardware -- unlike `+`
+    /// itself, which composers precision control does not govern also use to
+    /// compute an intermediate.
+    pub fn add_arith(self, other: Self) -> Self {
+        if let Some(result) = fast_binary_arith(&self, &other, |x, y| x + y) {
+            return result;
+        }
+        let mut result = F80::ZERO;
+        unsafe { extF80M_add(&self, &other, &mut result) };
+        result
+    }
+    /// FSUB/FISUB's result; see `add_arith`.
+    pub fn sub_arith(self, other: Self) -> Self {
+        if let Some(result) = fast_binary_arith(&self, &other, |x, y| x - y) {
+            return result;
+        }
+        let mut result = F80::ZERO;
+        unsafe { extF80M_sub(&self, &other, &mut result) };
+        result
+    }
+    /// FMUL/FIMUL's result; see `add_arith`.
+    pub fn mul_arith(self, other: Self) -> Self {
+        if let Some(result) = fast_binary_arith(&self, &other, |x, y| x * y) {
+            return result;
+        }
+        let mut result = F80::ZERO;
+        unsafe { extF80M_mul(&self, &other, &mut result) };
+        result
+    }
+    /// FDIV/FIDIV's result; see `add_arith`.
+    pub fn div_arith(self, other: Self) -> Self {
+        if let Some(result) = fast_binary_arith(&self, &other, |x, y| x / y) {
+            return result;
+        }
+        let mut result = F80::ZERO;
+        unsafe { extF80M_div(&self, &other, &mut result) };
+        result
     }
 }
 
