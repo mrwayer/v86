@@ -1,0 +1,63 @@
+name: Bottlify tests
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Build and test
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          filter: tree:0
+
+      - name: Setup Node.js version
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24.17.0'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Setup toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add wasm32-unknown-unknown
+          rustup component add rustfmt
+
+      - name: Install APT packages
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install nasm gdb qemu-system-x86 libc6-dev-i386 -y
+
+      - name: Build all-debug
+        run: |
+          rustc --version
+          make all-debug
+
+      - name: Build all
+        run: make all
+
+      - name: rustfmt check
+        run: make rustfmt
+
+      - name: Fetch namsmtests cache
+        uses: actions/cache@v5
+        id: cache-nasmtests
+        with:
+          path: tests/nasm/build/
+          key: ${{ runner.os }}-nasmtests
+
+      - name: Run nasmtests
+        run: MAX_PARALLEL_TESTS=1 make nasmtests
+
+      - name: Run nasmtests-force-jit
+        run: MAX_PARALLEL_TESTS=1 make nasmtests-force-jit
+
+      - name: Run rust-test
+        run: make rust-test
+
+      - name: Run jitpagingtests
+        run: make jitpagingtests
