@@ -200,7 +200,12 @@ pub fn precision_single() -> bool { unsafe { extF80_roundingPrecision == 32 } }
 #[inline]
 pub fn narrow_to_single(r: f64) -> Option<f64> {
     let s = r as f32;
-    if s.is_normal() || (s == 0.0 && r == 0.0) { Some(s as f64) } else { None }
+    if s.is_normal() || (s == 0.0 && r == 0.0) {
+        Some(s as f64)
+    }
+    else {
+        None
+    }
 }
 
 #[inline]
