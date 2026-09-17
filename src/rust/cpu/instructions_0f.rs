@@ -1808,7 +1808,11 @@ pub unsafe fn instr_660F58_mem(addr: i32, r: i32) {
 pub unsafe fn instr_F20F58(source: u64, r: i32) {
     // addsd xmm, xmm/mem64
     let destination = read_xmm64s(r);
-    let result = sse_binop_f64(f64::from_bits(destination), f64::from_bits(source), |a, b| a + b);
+    let result = sse_binop_f64(
+        f64::from_bits(destination),
+        f64::from_bits(source),
+        |a, b| a + b,
+    );
     write_xmm_f64(r, result);
 }
 pub unsafe fn instr_F20F58_reg(r1: i32, r2: i32) { instr_F20F58(read_xmm64s(r1), r2); }
@@ -1865,7 +1869,11 @@ pub unsafe fn instr_660F59_mem(addr: i32, r: i32) {
 pub unsafe fn instr_F20F59(source: u64, r: i32) {
     // mulsd xmm, xmm/mem64
     let destination = read_xmm64s(r);
-    let result = sse_binop_f64(f64::from_bits(destination), f64::from_bits(source), |a, b| a * b);
+    let result = sse_binop_f64(
+        f64::from_bits(destination),
+        f64::from_bits(source),
+        |a, b| a * b,
+    );
     write_xmm_f64(r, result);
 }
 pub unsafe fn instr_F20F59_reg(r1: i32, r2: i32) { instr_F20F59(read_xmm64s(r1), r2); }
