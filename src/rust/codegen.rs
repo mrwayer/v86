@@ -3087,7 +3087,11 @@ fn gen_fpu_binop_operands(
     }
 }
 
-/// `op st(0), st(0) <op> m32`, inline when st(0) carries the tag: the
+/// `op st(0), st(0) <op> m32`, inline when st(0) carries the tag, the memory
+/// operand is a normal or a zero, and so is the result: the same set
+/// `fpu_arm_ok` takes in the interpreter, so an SNaN/infinity/denormal
+/// operand or a result that overflowed or underflowed takes the helper arm,
+/// which raises what an inline double add, sub, mul or div cannot. The
 /// result goes back into the register whose tag was just read, so the tag
 /// is not written again.
 pub fn gen_fpu_binop_m32(
@@ -3103,26 +3107,45 @@ pub fn gen_fpu_binop_m32(
         return;
     }
     let modrm_slow = modrm_byte.clone();
+    let done = ctx.builder.block_void();
     let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+    let bits = ctx.builder.set_new_local();
     gen_fpu_tag_ok(ctx, &st0_addr);
+    gen_fpu_f32_bits_ok(ctx, &bits);
+    ctx.builder.and_i32();
     ctx.builder.if_void();
     gen_fpu_binop_operands(ctx, op, &st0_addr, &mut |ctx| {
-        gen_fpu_load_m32_as_f64(ctx, modrm_byte.clone())
+        ctx.builder.get_local(&bits);
+        ctx.builder.reinterpret_i32_as_f32();
+        ctx.builder.promote_f32_to_f64();
     });
     gen_fpu_apply_f64_binop(ctx, op);
+    ctx.builder.reinterpret_f64_as_i64();
+    let result = ctx.builder.set_new_local_i64();
+    gen_fpu_f64_bits_ok(ctx, &result);
+    ctx.builder.if_void();
+    ctx.builder.get_local_i64(&result);
+    ctx.builder.reinterpret_i64_as_f64();
     gen_fpu_store_f64_keeping_tag(ctx, &st0_addr);
+    ctx.builder.br(done);
+    ctx.builder.block_end();
+    ctx.builder.free_local_i64(result);
     ctx.builder.else_();
     gen_note_tag_lost(ctx.builder, X87_SITE_ARM_BINOP_M32);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(bits);
     ctx.builder.const_i32(0);
     gen_fpu_load_m32(ctx, modrm_slow);
     ctx.builder.call_fn3_i32_i64_i32(helper);
     ctx.builder.block_end();
-    ctx.builder.free_local(st0_addr);
 }
 
-/// `op st(0), st(0) <op> m64`, inline when st(0) carries the tag: the
-/// result goes back into the register whose tag was just read, so the tag
-/// is not written again.
+/// `op st(0), st(0) <op> m64`, inline when st(0) carries the tag, the memory
+/// operand is a normal or a zero, and so is the result -- see
+/// `gen_fpu_binop_m32`. The result goes back into the register whose tag
+/// was just read, so the tag is not written again.
 pub fn gen_fpu_binop_m64(
     ctx: &mut JitContext,
     modrm_byte: ModrmByte,
@@ -3136,26 +3159,48 @@ pub fn gen_fpu_binop_m64(
         return;
     }
     let modrm_slow = modrm_byte.clone();
+    let done = ctx.builder.block_void();
     let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+    let bits = ctx.builder.set_new_local_i64();
     gen_fpu_tag_ok(ctx, &st0_addr);
+    gen_fpu_f64_bits_ok(ctx, &bits);
+    ctx.builder.and_i32();
     ctx.builder.if_void();
     gen_fpu_binop_operands(ctx, op, &st0_addr, &mut |ctx| {
-        gen_fpu_load_m64_as_f64(ctx, modrm_byte.clone())
+        ctx.builder.get_local_i64(&bits);
+        ctx.builder.reinterpret_i64_as_f64();
     });
     gen_fpu_apply_f64_binop(ctx, op);
+    ctx.builder.reinterpret_f64_as_i64();
+    let result = ctx.builder.set_new_local_i64();
+    gen_fpu_f64_bits_ok(ctx, &result);
+    ctx.builder.if_void();
+    ctx.builder.get_local_i64(&result);
+    ctx.builder.reinterpret_i64_as_f64();
     gen_fpu_store_f64_keeping_tag(ctx, &st0_addr);
+    ctx.builder.br(done);
+    ctx.builder.block_end();
+    ctx.builder.free_local_i64(result);
     ctx.builder.else_();
     gen_note_tag_lost(ctx.builder, X87_SITE_ARM_BINOP_M64);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local_i64(bits);
     ctx.builder.const_i32(0);
     gen_fpu_load_m64(ctx, modrm_slow);
     ctx.builder.call_fn3_i32_i64_i32(helper);
     ctx.builder.block_end();
-    ctx.builder.free_local(st0_addr);
 }
 
-/// `op st(target), st(0) <op> st(i)`, inline when both carry the tag. The
-/// target is st(0) or st(i), one of the two registers whose tag was just
-/// read, so the tag is not written again.
+/// `op st(target), st(0) <op> st(i)`, inline when both carry the tag and the
+/// result is a normal or a zero: a tagged register already holds only what
+/// `fpu_arm_ok` accepts, so the two operands need no separate check, but
+/// their result can still overflow or underflow (a divide by the zero
+/// `fpu_arm_ok` lets through, among others), and that result must not stay
+/// tagged untested -- see `gen_fpu_binop_m32`. The target is st(0) or
+/// st(i), one of the two registers whose tag was just read, so the tag is
+/// not written again.
 pub fn gen_fpu_binop_sti(
     ctx: &mut JitContext,
     sti: u32,
@@ -3170,6 +3215,7 @@ pub fn gen_fpu_binop_sti(
         ctx.builder.call_fn3_i32_i64_i32(helper);
         return;
     }
+    let done = ctx.builder.block_void();
     let top = gen_fpu_top(ctx);
     let st0_addr = gen_fpu_st_addr_from(ctx, &top, 0);
     let op_addr = gen_fpu_st_addr_from(ctx, &top, sti);
@@ -3180,16 +3226,26 @@ pub fn gen_fpu_binop_sti(
     ctx.builder.if_void();
     gen_fpu_binop_operands(ctx, op, &st0_addr, &mut |ctx| gen_fpu_load_tagged_f64(ctx, &op_addr));
     gen_fpu_apply_f64_binop(ctx, op);
+    ctx.builder.reinterpret_f64_as_i64();
+    let result = ctx.builder.set_new_local_i64();
+    gen_fpu_f64_bits_ok(ctx, &result);
+    ctx.builder.if_void();
+    ctx.builder.get_local_i64(&result);
+    ctx.builder.reinterpret_i64_as_f64();
     let target_addr = if target_sti == 0 { &st0_addr } else { &op_addr };
     gen_fpu_store_f64_keeping_tag(ctx, target_addr);
+    ctx.builder.br(done);
+    ctx.builder.block_end();
+    ctx.builder.free_local_i64(result);
     ctx.builder.else_();
     gen_note_tag_lost(ctx.builder, X87_SITE_ARM_BINOP_STI);
+    ctx.builder.block_end();
+    ctx.builder.free_local(op_addr);
+    ctx.builder.free_local(st0_addr);
     ctx.builder.const_i32(target_sti as i32);
     gen_fpu_get_sti(ctx, sti);
     ctx.builder.call_fn3_i32_i64_i32(helper);
     ctx.builder.block_end();
-    ctx.builder.free_local(op_addr);
-    ctx.builder.free_local(st0_addr);
 }
 
 /// Pops the stack: the top slot marked empty and the pointer moved on.
