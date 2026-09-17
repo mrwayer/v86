@@ -1,7 +1,7 @@
 #![allow(non_upper_case_globals)]
 
 use crate::config;
-use crate::cpu::fpu::fpu_set_tag_word;
+use crate::cpu::fpu::{fpu_set_tag_word, set_control_word};
 use crate::cpu::global_pointers::*;
 use crate::cpu::memory;
 use crate::cpu::misc_instr::{
@@ -5065,7 +5065,7 @@ pub unsafe fn reset_cpu() {
 
     *fpu_stack_empty = 0xFF;
     *fpu_stack_ptr = 0;
-    *fpu_control_word = 0x37F;
+    set_control_word(0x37F);
     *fpu_status_word = 0;
     *fpu_ip = 0;
     *fpu_ip_selector = 0;

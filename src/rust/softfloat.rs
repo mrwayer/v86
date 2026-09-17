@@ -186,12 +186,30 @@ fn of_f64_fast(v: f64) -> Option<F80> {
     })
 }
 
+/// Whether the control word asks for results rounded to 24 bits.
+#[inline]
+pub fn precision_single() -> bool { unsafe { extF80_roundingPrecision == 32 } }
+
+/// The double rounded to 24 bits, as an instruction under single precision
+/// control leaves its result -- provided the rounded value is a normal
+/// single, or a zero that was a zero already; nothing otherwise, since the
+/// instruction keeps the format's wide exponent, which a single does not
+/// hold, and a zero the narrowing produced is an underflow the library
+/// reports. Narrowing the double is the 24-bit rounding of the exact result:
+/// the double holds more than twice the bits, so the two roundings agree.
+#[inline]
+pub fn narrow_to_single(r: f64) -> Option<f64> {
+    let s = r as f32;
+    if s.is_normal() || (s == 0.0 && r == 0.0) { Some(s as f64) } else { None }
+}
+
 #[inline]
 fn fast_binary(x: &F80, y: &F80, op: fn(f64, f64) -> f64) -> Option<F80> {
     if !unsafe { FAST_F80 } {
         return None;
     }
-    of_f64_fast(op(to_f64_fast(x)?, to_f64_fast(y)?))
+    let r = op(to_f64_fast(x)?, to_f64_fast(y)?);
+    of_f64_fast(if precision_single() { narrow_to_single(r)? } else { r })
 }
 
 #[inline]

@@ -136,6 +136,22 @@ pub enum FpuOp {
 /// library sets and the arm would not, so such an instruction is the helper's.
 fn fpu_arm_ok(x: f64) -> bool { x.is_normal() || x == 0.0 }
 
+/// The result an arm may keep, at the precision the control word asks for:
+/// the double itself when a normal or a zero, or under single precision
+/// control the double narrowed to 24 bits on the terms `narrow_to_single`
+/// sets; nothing for what the helper must compute instead.
+fn fpu_arm_result(r: f64) -> Option<f64> {
+    if crate::softfloat::precision_single() {
+        crate::softfloat::narrow_to_single(r)
+    }
+    else if fpu_arm_ok(r) {
+        Some(r)
+    }
+    else {
+        None
+    }
+}
+
 fn fpu_apply(op: FpuOp, st0: f64, other: f64) -> f64 {
     match op {
         FpuOp::Add => st0 + other,
@@ -163,10 +179,8 @@ pub unsafe fn fpu_op_m32(addr: i32, op: FpuOp) {
     let bits = return_on_pagefault!(safe_read32s(addr));
     let top = *fpu_stack_ptr as i32;
     let other = f32::from_bits(bits as u32) as f64;
-    match fpu_tagged(top).map(|st0| (st0, fpu_apply(op, st0, other))) {
-        Some((st0, r)) if fpu_arm_ok(st0) && fpu_arm_ok(other) && fpu_arm_ok(r) => {
-            fpu_write_tagged(top, r)
-        },
+    match fpu_tagged(top).map(|st0| (st0, fpu_arm_result(fpu_apply(op, st0, other)))) {
+        Some((st0, Some(r))) if fpu_arm_ok(st0) && fpu_arm_ok(other) => fpu_write_tagged(top, r),
         _ => fpu_op_by_helper(op, 0, f32_to_f80(bits)),
     }
 }
@@ -176,10 +190,8 @@ pub unsafe fn fpu_op_m64(addr: i32, op: FpuOp) {
     let bits = return_on_pagefault!(safe_read64s(addr));
     let top = *fpu_stack_ptr as i32;
     let other = f64::from_bits(bits);
-    match fpu_tagged(top).map(|st0| (st0, fpu_apply(op, st0, other))) {
-        Some((st0, r)) if fpu_arm_ok(st0) && fpu_arm_ok(other) && fpu_arm_ok(r) => {
-            fpu_write_tagged(top, r)
-        },
+    match fpu_tagged(top).map(|st0| (st0, fpu_arm_result(fpu_apply(op, st0, other)))) {
+        Some((st0, Some(r))) if fpu_arm_ok(st0) && fpu_arm_ok(other) => fpu_write_tagged(top, r),
         _ => fpu_op_by_helper(op, 0, f64_to_f80(bits)),
     }
 }
@@ -189,12 +201,9 @@ pub unsafe fn fpu_op_sti(i: i32, target: i32, op: FpuOp, pop: bool) {
     let top = *fpu_stack_ptr as i32;
     match (fpu_tagged(top), fpu_tagged(top + i & 7)) {
         (Some(st0), Some(sti)) if fpu_arm_ok(st0) && fpu_arm_ok(sti) => {
-            let r = fpu_apply(op, st0, sti);
-            if fpu_arm_ok(r) {
-                fpu_write_tagged(top + target & 7, r)
-            }
-            else {
-                fpu_op_by_helper(op, target, fpu_get_sti(i))
+            match fpu_arm_result(fpu_apply(op, st0, sti)) {
+                Some(r) => fpu_write_tagged(top + target & 7, r),
+                None => fpu_op_by_helper(op, target, fpu_get_sti(i)),
             }
         },
         _ => fpu_op_by_helper(op, target, fpu_get_sti(i)),
@@ -527,6 +536,9 @@ pub unsafe fn set_control_word(cw: u16) {
             Precision::P80
         },
     });
+    // Generated code reads this rather than the control word, one byte
+    // against a load, a mask and a compare on every inline arithmetic result.
+    *fpu_precision_single = (precision_control == 0) as u8;
 }
 
 pub unsafe fn fpu_invalid_arithmetic() { *fpu_status_word |= FPU_EX_I; }

@@ -16,7 +16,7 @@ use crate::opstats;
 use crate::profiler;
 use crate::regs;
 use crate::softfloat::F80;
-use crate::wasmgen::wasm_builder::{WasmBuilder, WasmLocal, WasmLocalI64};
+use crate::wasmgen::wasm_builder::{Label, WasmBuilder, WasmLocal, WasmLocalI64};
 
 pub fn gen_add_cs_offset(ctx: &mut JitContext) {
     if !ctx.cpu.has_flat_segmentation() {
@@ -3087,6 +3087,73 @@ fn gen_fpu_binop_operands(
     }
 }
 
+/// Pushes whether the single in `single`, narrowed from the double in
+/// `double`, is what an inline arm may store: a normal single, or a zero
+/// that was a zero already. A tagged double is a normal or a zero, but
+/// narrowing it can still overflow to infinity or underflow to a denormal or
+/// to zero, and the last of those needs the double, not the single: a
+/// nonzero double that merely rounds down to zero in single precision has
+/// underflowed as surely as one that rounds to a denormal, and the helper
+/// arm is where the flag for that is raised. The zero this asks about is a
+/// numeric zero, not a bit pattern: a tiny negative double narrows to -0.0,
+/// which a raw-bits comparison against 0 would call nonzero.
+fn gen_fpu_narrowed_ok(ctx: &mut JitContext, single: &WasmLocal, double: &WasmLocalI64) {
+    gen_fpu_f32_bits_ok(ctx, single);
+    ctx.builder.get_local(single);
+    ctx.builder.const_i32(0x7FFF_FFFF);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(0);
+    ctx.builder.ne_i32();
+    ctx.builder.get_local_i64(double);
+    ctx.builder.const_i64(1);
+    ctx.builder.shl_i64();
+    ctx.builder.const_i64(0);
+    ctx.builder.eq_i64();
+    ctx.builder.or_i32();
+    ctx.builder.and_i32();
+}
+
+/// The result of an inline arithmetic arm, on the stack as a double, into
+/// the register at `target`, which already carries the tag, and out through
+/// `done` -- when the result is one the arm may keep; otherwise it falls
+/// through to the helper arm the caller emits after it. What the arm may
+/// keep depends on the precision control: at 53 and 64 bits the double
+/// itself, when a normal or a zero; at 24 bits, the double narrowed to a
+/// single, when that single is a normal or the zero of a zero, since the
+/// instruction rounds its result to 24 bits and a result outside the
+/// single's range keeps the format's wider exponent, which only the library
+/// holds. The narrowing is the 24-bit rounding of the exact result: the
+/// double holds more than twice the bits, so the two roundings agree.
+fn gen_fpu_arm_result(ctx: &mut JitContext, target: &WasmLocal, done: Label) {
+    ctx.builder.reinterpret_f64_as_i64();
+    let result = ctx.builder.set_new_local_i64();
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_precision_single as u32);
+    ctx.builder.if_void();
+    gen_get_f64(ctx, &result);
+    ctx.builder.demote_f64_to_f32();
+    ctx.builder.reinterpret_f32_as_i32();
+    let single = ctx.builder.set_new_local();
+    gen_fpu_narrowed_ok(ctx, &single, &result);
+    ctx.builder.if_void();
+    ctx.builder.get_local(&single);
+    ctx.builder.reinterpret_i32_as_f32();
+    ctx.builder.promote_f32_to_f64();
+    gen_fpu_store_f64_keeping_tag(ctx, target);
+    ctx.builder.br(done);
+    ctx.builder.block_end();
+    ctx.builder.free_local(single);
+    ctx.builder.else_();
+    gen_fpu_f64_bits_ok(ctx, &result);
+    ctx.builder.if_void();
+    gen_get_f64(ctx, &result);
+    gen_fpu_store_f64_keeping_tag(ctx, target);
+    ctx.builder.br(done);
+    ctx.builder.block_end();
+    ctx.builder.block_end();
+    ctx.builder.free_local_i64(result);
+}
+
 /// `op st(0), st(0) <op> m32`, inline when st(0) carries the tag, the memory
 /// operand is a normal or a zero, and so is the result: the same set
 /// `fpu_arm_ok` takes in the interpreter, so an SNaN/infinity/denormal
@@ -3121,16 +3188,7 @@ pub fn gen_fpu_binop_m32(
         ctx.builder.promote_f32_to_f64();
     });
     gen_fpu_apply_f64_binop(ctx, op);
-    ctx.builder.reinterpret_f64_as_i64();
-    let result = ctx.builder.set_new_local_i64();
-    gen_fpu_f64_bits_ok(ctx, &result);
-    ctx.builder.if_void();
-    ctx.builder.get_local_i64(&result);
-    ctx.builder.reinterpret_i64_as_f64();
-    gen_fpu_store_f64_keeping_tag(ctx, &st0_addr);
-    ctx.builder.br(done);
-    ctx.builder.block_end();
-    ctx.builder.free_local_i64(result);
+    gen_fpu_arm_result(ctx, &st0_addr, done);
     ctx.builder.else_();
     gen_note_tag_lost(ctx.builder, X87_SITE_ARM_BINOP_M32);
     ctx.builder.block_end();
@@ -3172,16 +3230,7 @@ pub fn gen_fpu_binop_m64(
         ctx.builder.reinterpret_i64_as_f64();
     });
     gen_fpu_apply_f64_binop(ctx, op);
-    ctx.builder.reinterpret_f64_as_i64();
-    let result = ctx.builder.set_new_local_i64();
-    gen_fpu_f64_bits_ok(ctx, &result);
-    ctx.builder.if_void();
-    ctx.builder.get_local_i64(&result);
-    ctx.builder.reinterpret_i64_as_f64();
-    gen_fpu_store_f64_keeping_tag(ctx, &st0_addr);
-    ctx.builder.br(done);
-    ctx.builder.block_end();
-    ctx.builder.free_local_i64(result);
+    gen_fpu_arm_result(ctx, &st0_addr, done);
     ctx.builder.else_();
     gen_note_tag_lost(ctx.builder, X87_SITE_ARM_BINOP_M64);
     ctx.builder.block_end();
@@ -3226,17 +3275,8 @@ pub fn gen_fpu_binop_sti(
     ctx.builder.if_void();
     gen_fpu_binop_operands(ctx, op, &st0_addr, &mut |ctx| gen_fpu_load_tagged_f64(ctx, &op_addr));
     gen_fpu_apply_f64_binop(ctx, op);
-    ctx.builder.reinterpret_f64_as_i64();
-    let result = ctx.builder.set_new_local_i64();
-    gen_fpu_f64_bits_ok(ctx, &result);
-    ctx.builder.if_void();
-    ctx.builder.get_local_i64(&result);
-    ctx.builder.reinterpret_i64_as_f64();
     let target_addr = if target_sti == 0 { &st0_addr } else { &op_addr };
-    gen_fpu_store_f64_keeping_tag(ctx, target_addr);
-    ctx.builder.br(done);
-    ctx.builder.block_end();
-    ctx.builder.free_local_i64(result);
+    gen_fpu_arm_result(ctx, target_addr, done);
     ctx.builder.else_();
     gen_note_tag_lost(ctx.builder, X87_SITE_ARM_BINOP_STI);
     ctx.builder.block_end();
@@ -3447,42 +3487,20 @@ pub fn gen_fpu_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
         let st0_addr = gen_fpu_st_addr(ctx, 0);
         gen_fpu_tag_ok(ctx, &st0_addr);
         ctx.builder.if_void();
-        gen_fpu_load_tagged_f64(ctx, &st0_addr);
+        ctx.builder.get_local(&st0_addr);
+        ctx.builder.load_unaligned_i64(0);
+        let double = ctx.builder.tee_new_local_i64();
+        ctx.builder.reinterpret_i64_as_f64();
         ctx.builder.demote_f64_to_f32();
         ctx.builder.reinterpret_f32_as_i32();
         let value_local = ctx.builder.set_new_local();
-        // A tagged double is a normal or a zero, but narrowing it to a
-        // single can still overflow to infinity or underflow to a single
-        // denormal or zero -- fpu_arm_ok never tested that. The zero case
-        // needs the double, not the narrowed single: fpu_store_st0_m32
-        // takes its inline arm on `st0 == 0.0 || s.is_normal()`, so a
-        // nonzero double that merely rounds down to zero in single
-        // precision still underflows and must reach the helper that raises
-        // UE, exactly as a double that rounds down to a single denormal
-        // does.
-        gen_fpu_f32_bits_ok(ctx, &value_local);
-        // The zero this excludes is a numeric zero, not a bit pattern: a
-        // tiny negative double narrows to -0.0 (bits 0x80000000), which a
-        // raw-bits comparison against 0 would call "nonzero" and wrongly
-        // send down the inline arm.
-        ctx.builder.get_local(&value_local);
-        ctx.builder.const_i32(0x7FFF_FFFF);
-        ctx.builder.and_i32();
-        ctx.builder.const_i32(0);
-        ctx.builder.ne_i32();
-        ctx.builder.get_local(&st0_addr);
-        ctx.builder.load_unaligned_i64(0);
-        ctx.builder.const_i64(1);
-        ctx.builder.shl_i64();
-        ctx.builder.const_i64(0);
-        ctx.builder.eq_i64();
-        ctx.builder.or_i32();
-        ctx.builder.and_i32();
+        gen_fpu_narrowed_ok(ctx, &value_local, &double);
         ctx.builder.if_void();
         gen_safe_write32(ctx, &address_local, &value_local);
         ctx.builder.br(done);
         ctx.builder.block_end();
         ctx.builder.free_local(value_local);
+        ctx.builder.free_local_i64(double);
         ctx.builder.else_();
         gen_note_tag_lost(ctx.builder, X87_SITE_ARM_STORE_M32);
         ctx.builder.block_end();
@@ -3676,23 +3694,28 @@ pub fn gen_fpu_sign_op(ctx: &mut JitContext, r: u32, absolute: bool) {
     ctx.builder.free_local(st0_addr);
 }
 
-/// `fsqrt`: the root taken at the precision the arithmetic already runs at.
+/// `fsqrt`: the root taken at the precision the arithmetic already runs at,
+/// and kept on the same terms as an arithmetic result -- so the root of a
+/// negative, a NaN, is the helper's to raise, and a root below the single's
+/// range under precision control 24 is the library's.
 pub fn gen_fpu_fsqrt(ctx: &mut JitContext, r: u32) {
     if !crate::jit::x87_tagged_more_enabled() {
         gen_fn1_const(ctx.builder, "instr16_D9_7_reg", r);
         return;
     }
+    let done = ctx.builder.block_void();
     let st0_addr = gen_fpu_st_addr(ctx, 0);
     gen_fpu_tag_ok(ctx, &st0_addr);
     ctx.builder.if_void();
     gen_fpu_load_tagged_f64(ctx, &st0_addr);
     ctx.builder.sqrt_f64();
-    gen_fpu_store_f64_keeping_tag(ctx, &st0_addr);
+    gen_fpu_arm_result(ctx, &st0_addr, done);
     ctx.builder.else_();
     gen_note_tag_lost(ctx.builder, X87_SITE_ARM_FSQRT);
-    gen_fn1_const(ctx.builder, "instr16_D9_7_reg", r);
     ctx.builder.block_end();
     ctx.builder.free_local(st0_addr);
+    gen_fn1_const(ctx.builder, "instr16_D9_7_reg", r);
+    ctx.builder.block_end();
 }
 
 /// `fst st(i)` / `fstp st(i)`: a tagged st(0) copied to another register, tag

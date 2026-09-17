@@ -75,6 +75,9 @@ pub const fpu_ip: *mut i32 = 1048 as *mut i32;
 pub const fpu_ip_selector: *mut i32 = 1052 as *mut i32;
 pub const fpu_dp: *mut i32 = 1056 as *mut i32;
 pub const fpu_dp_selector: *mut i32 = 1060 as *mut i32;
+/// Whether the control word's precision field asks for 24-bit results;
+/// written with the control word, read by the inline arithmetic arms.
+pub const fpu_precision_single: *mut u8 = 1064 as *mut u8;
 pub const tss_size_32: *mut bool = 1128 as *mut bool;
 
 pub const sse_scratch_register: *mut reg128 = 1136 as *mut reg128;
