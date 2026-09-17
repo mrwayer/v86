@@ -62,6 +62,17 @@ jobs:
         continue-on-error: true
         run: make rust-test
 
+      - name: Fetch image cache
+        uses: actions/cache@v5
+        id: cache-images
+        with:
+          path: images/
+          key: ${{ runner.os }}-images-linux4
+
+      - name: Download linux4.iso
+        if: steps.cache-images.outputs.cache-hit != 'true'
+        run: mkdir -p images && curl --compressed --output-dir images --remote-name-all https://i.copy.sh/linux4.iso
+
       - name: Run jitpagingtests
         id: jitpagingtests
         continue-on-error: true
