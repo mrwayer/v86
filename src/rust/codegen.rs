@@ -3461,7 +3461,13 @@ pub fn gen_fpu_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
         // UE, exactly as a double that rounds down to a single denormal
         // does.
         gen_fpu_f32_bits_ok(ctx, &value_local);
+        // The zero this excludes is a numeric zero, not a bit pattern: a
+        // tiny negative double narrows to -0.0 (bits 0x80000000), which a
+        // raw-bits comparison against 0 would call "nonzero" and wrongly
+        // send down the inline arm.
         ctx.builder.get_local(&value_local);
+        ctx.builder.const_i32(0x7FFF_FFFF);
+        ctx.builder.and_i32();
         ctx.builder.const_i32(0);
         ctx.builder.ne_i32();
         ctx.builder.get_local(&st0_addr);
