@@ -3453,10 +3453,25 @@ pub fn gen_fpu_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
         let value_local = ctx.builder.set_new_local();
         // A tagged double is a normal or a zero, but narrowing it to a
         // single can still overflow to infinity or underflow to a single
-        // denormal or zero -- fpu_arm_ok never tested that, so the narrowed
-        // bits get their own check before the inline write, matching the
-        // interpreter's fpu_store_st0_m32.
+        // denormal or zero -- fpu_arm_ok never tested that. The zero case
+        // needs the double, not the narrowed single: fpu_store_st0_m32
+        // takes its inline arm on `st0 == 0.0 || s.is_normal()`, so a
+        // nonzero double that merely rounds down to zero in single
+        // precision still underflows and must reach the helper that raises
+        // UE, exactly as a double that rounds down to a single denormal
+        // does.
         gen_fpu_f32_bits_ok(ctx, &value_local);
+        ctx.builder.get_local(&value_local);
+        ctx.builder.const_i32(0);
+        ctx.builder.ne_i32();
+        ctx.builder.get_local(&st0_addr);
+        ctx.builder.load_unaligned_i64(0);
+        ctx.builder.const_i64(1);
+        ctx.builder.shl_i64();
+        ctx.builder.const_i64(0);
+        ctx.builder.eq_i64();
+        ctx.builder.or_i32();
+        ctx.builder.and_i32();
         ctx.builder.if_void();
         gen_safe_write32(ctx, &address_local, &value_local);
         ctx.builder.br(done);
