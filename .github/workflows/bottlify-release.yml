@@ -7,8 +7,11 @@ name: bottlify-release
 
 on:
   workflow_dispatch:
+  # Every pushed branch is built, so a commit that does not compile is known
+  # before anyone measures it; the tag is by commit, so a branch build and a
+  # master build of the same commit are one release.
   push:
-    branches: [master]
+    branches: ['**']
 
 permissions:
   contents: write
