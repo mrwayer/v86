@@ -232,6 +232,82 @@ fn sse_mov_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32) {
     ctx.builder.store_aligned_i64(0);
 }
 
+// The packed single-precision forms, done where the registers lie: the
+// destination's four lanes against the source's in one v128 instruction,
+// where a helper copied the source aside, walked the lanes and wrote the
+// register back. Measured on a title's level: the helper-bound packed forms
+// were forty million per twenty seconds, an eighth of the compiled time.
+// The operands go on the stack in the order the helpers took them, so that
+// a NaN chosen between two comes from the same side as before.
+
+#[derive(Copy, Clone)]
+enum PackedF32Op {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+}
+
+fn gen_load_v128(ctx: &mut JitContext, addr: u32) {
+    ctx.builder.const_i32(addr as i32);
+    ctx.builder.load_aligned_v128(0);
+}
+
+fn gen_packed_f32(ctx: &mut JitContext, source: u32, r: u32, op: PackedF32Op) {
+    let dest = global_pointers::get_reg_xmm_offset(r);
+    ctx.builder.const_i32(dest as i32);
+    match op {
+        PackedF32Op::Add | PackedF32Op::Mul => {
+            gen_load_v128(ctx, source);
+            gen_load_v128(ctx, dest);
+            if matches!(op, PackedF32Op::Add) {
+                ctx.builder.add_f32x4()
+            }
+            else {
+                ctx.builder.mul_f32x4()
+            }
+        },
+        PackedF32Op::Sub | PackedF32Op::Div => {
+            gen_load_v128(ctx, dest);
+            gen_load_v128(ctx, source);
+            if matches!(op, PackedF32Op::Sub) {
+                ctx.builder.sub_f32x4()
+            }
+            else {
+                ctx.builder.div_f32x4()
+            }
+        },
+        // The destination where it is strictly below (above) the source and
+        // the source otherwise: so for a NaN on either side, and for two
+        // zeros of any sign, the source, as the processor has it.
+        PackedF32Op::Min | PackedF32Op::Max => {
+            gen_load_v128(ctx, dest);
+            gen_load_v128(ctx, source);
+            gen_load_v128(ctx, dest);
+            gen_load_v128(ctx, source);
+            if matches!(op, PackedF32Op::Min) {
+                ctx.builder.lt_f32x4()
+            }
+            else {
+                ctx.builder.gt_f32x4()
+            }
+            ctx.builder.bitselect_v128();
+        },
+    }
+    ctx.builder.store_aligned_v128(0);
+}
+
+fn sse_packed_f32_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32, op: PackedF32Op) {
+    gen_packed_f32(ctx, global_pointers::get_reg_xmm_offset(r1), r2, op)
+}
+fn sse_packed_f32_xmm_mem(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32, op: PackedF32Op) {
+    let source = global_pointers::sse_scratch_register as u32;
+    codegen::gen_modrm_resolve_safe_read128(ctx, modrm_byte, source);
+    gen_packed_f32(ctx, source, r, op)
+}
+
 fn mmx_read64_mm_mem32(ctx: &mut JitContext, name: &str, modrm_byte: ModrmByte, r: u32) {
     codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
     ctx.builder.const_i32(r as i32);
@@ -6177,10 +6253,10 @@ pub fn instr_660F57_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F58_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_0F58", modrm_byte, r);
+    sse_packed_f32_xmm_mem(ctx, modrm_byte, r, PackedF32Op::Add)
 }
 pub fn instr_0F58_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_0F58", r1, r2);
+    sse_packed_f32_xmm_xmm(ctx, r1, r2, PackedF32Op::Add)
 }
 pub fn instr_660F58_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     sse_read128_xmm_mem(ctx, "instr_660F58", modrm_byte, r);
@@ -6202,10 +6278,10 @@ pub fn instr_F30F58_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_0F59", modrm_byte, r);
+    sse_packed_f32_xmm_mem(ctx, modrm_byte, r, PackedF32Op::Mul)
 }
 pub fn instr_0F59_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_0F59", r1, r2);
+    sse_packed_f32_xmm_xmm(ctx, r1, r2, PackedF32Op::Mul)
 }
 pub fn instr_660F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     sse_read128_xmm_mem(ctx, "instr_660F59", modrm_byte, r);
@@ -6271,10 +6347,10 @@ pub fn instr_F30F5B_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F5C_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_0F5C", modrm_byte, r);
+    sse_packed_f32_xmm_mem(ctx, modrm_byte, r, PackedF32Op::Sub)
 }
 pub fn instr_0F5C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_0F5C", r1, r2);
+    sse_packed_f32_xmm_xmm(ctx, r1, r2, PackedF32Op::Sub)
 }
 pub fn instr_660F5C_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     sse_read128_xmm_mem(ctx, "instr_660F5C", modrm_byte, r);
@@ -6296,10 +6372,10 @@ pub fn instr_F30F5C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F5D_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_0F5D", modrm_byte, r);
+    sse_packed_f32_xmm_mem(ctx, modrm_byte, r, PackedF32Op::Min)
 }
 pub fn instr_0F5D_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_0F5D", r1, r2);
+    sse_packed_f32_xmm_xmm(ctx, r1, r2, PackedF32Op::Min)
 }
 pub fn instr_660F5D_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     sse_read128_xmm_mem(ctx, "instr_660F5D", modrm_byte, r);
@@ -6321,10 +6397,10 @@ pub fn instr_F30F5D_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F5E_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_0F5E", modrm_byte, r);
+    sse_packed_f32_xmm_mem(ctx, modrm_byte, r, PackedF32Op::Div)
 }
 pub fn instr_0F5E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_0F5E", r1, r2);
+    sse_packed_f32_xmm_xmm(ctx, r1, r2, PackedF32Op::Div)
 }
 pub fn instr_660F5E_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     sse_read128_xmm_mem(ctx, "instr_660F5E", modrm_byte, r);
@@ -6346,10 +6422,10 @@ pub fn instr_F30F5E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F5F_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
-    sse_read128_xmm_mem(ctx, "instr_0F5F", modrm_byte, r);
+    sse_packed_f32_xmm_mem(ctx, modrm_byte, r, PackedF32Op::Max)
 }
 pub fn instr_0F5F_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
-    sse_read128_xmm_xmm(ctx, "instr_0F5F", r1, r2);
+    sse_packed_f32_xmm_xmm(ctx, r1, r2, PackedF32Op::Max)
 }
 pub fn instr_660F5F_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     sse_read128_xmm_mem(ctx, "instr_660F5F", modrm_byte, r);

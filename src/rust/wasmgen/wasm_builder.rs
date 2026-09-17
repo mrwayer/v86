@@ -767,6 +767,56 @@ impl WasmBuilder {
         write_leb_u32(&mut self.instruction_body, byte_offset);
     }
 
+    pub fn store_aligned_f32(&mut self, byte_offset: u32) {
+        self.instruction_body.push(op::OP_F32STORE);
+        self.instruction_body.push(op::MEM_ALIGN32);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
+    pub fn store_aligned_f64(&mut self, byte_offset: u32) {
+        self.instruction_body.push(op::OP_F64STORE);
+        self.instruction_body.push(op::MEM_ALIGN64);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
+    fn simd(&mut self, instruction: u8) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        write_leb_u32(&mut self.instruction_body, instruction as u32);
+    }
+
+    pub fn load_aligned_v128(&mut self, byte_offset: u32) {
+        self.simd(op::SIMD_V128_LOAD);
+        self.instruction_body.push(op::MEM_ALIGN128);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
+    pub fn store_aligned_v128(&mut self, byte_offset: u32) {
+        self.simd(op::SIMD_V128_STORE);
+        self.instruction_body.push(op::MEM_ALIGN128);
+        write_leb_u32(&mut self.instruction_body, byte_offset);
+    }
+
+    /// Each byte of the result from the byte of the two operands it names:
+    /// 0 to 15 the first, 16 to 31 the second.
+    pub fn shuffle_i8x16(&mut self, lanes: &[u8; 16]) {
+        self.simd(op::SIMD_I8X16_SHUFFLE);
+        self.instruction_body.extend_from_slice(lanes);
+    }
+
+    pub fn add_f32x4(&mut self) { self.simd(op::SIMD_F32X4_ADD); }
+    pub fn sub_f32x4(&mut self) { self.simd(op::SIMD_F32X4_SUB); }
+    pub fn mul_f32x4(&mut self) { self.simd(op::SIMD_F32X4_MUL); }
+    pub fn div_f32x4(&mut self) { self.simd(op::SIMD_F32X4_DIV); }
+    pub fn eq_f32x4(&mut self) { self.simd(op::SIMD_F32X4_EQ); }
+    pub fn ne_f32x4(&mut self) { self.simd(op::SIMD_F32X4_NE); }
+    pub fn lt_f32x4(&mut self) { self.simd(op::SIMD_F32X4_LT); }
+    pub fn gt_f32x4(&mut self) { self.simd(op::SIMD_F32X4_GT); }
+    pub fn le_f32x4(&mut self) { self.simd(op::SIMD_F32X4_LE); }
+    pub fn not_v128(&mut self) { self.simd(op::SIMD_V128_NOT); }
+    pub fn and_v128(&mut self) { self.simd(op::SIMD_V128_AND); }
+    pub fn or_v128(&mut self) { self.simd(op::SIMD_V128_OR); }
+    pub fn bitselect_v128(&mut self) { self.simd(op::SIMD_V128_BITSELECT); }
+
     pub fn load_aligned_i32(&mut self, byte_offset: u32) {
         self.instruction_body.push(op::OP_I32LOAD);
         self.instruction_body.push(op::MEM_ALIGN32);
@@ -880,6 +930,10 @@ impl WasmBuilder {
     }
     pub fn promote_f32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64PROMOTEF32); }
     pub fn demote_f64_to_f32(&mut self) { self.instruction_body.push(op::OP_F32DEMOTEF64); }
+    pub fn add_f32(&mut self) { self.instruction_body.push(op::OP_F32ADD); }
+    pub fn sub_f32(&mut self) { self.instruction_body.push(op::OP_F32SUB); }
+    pub fn mul_f32(&mut self) { self.instruction_body.push(op::OP_F32MUL); }
+    pub fn div_f32(&mut self) { self.instruction_body.push(op::OP_F32DIV); }
     pub fn add_f64(&mut self) { self.instruction_body.push(op::OP_F64ADD); }
     pub fn sub_f64(&mut self) { self.instruction_body.push(op::OP_F64SUB); }
     pub fn mul_f64(&mut self) { self.instruction_body.push(op::OP_F64MUL); }

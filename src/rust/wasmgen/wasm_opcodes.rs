@@ -221,3 +221,23 @@ c!(MEM_NO_ALIGN, 0);
 c!(MEM_ALIGN16, 1);
 c!(MEM_ALIGN32, 2);
 c!(MEM_ALIGN64, 3);
+c!(MEM_ALIGN128, 4);
+
+// A simd instruction is the prefix byte, then the instruction as an unsigned leb.
+c!(OP_SIMD_PREFIX, 0xfd);
+c!(SIMD_V128_LOAD, 0x00);
+c!(SIMD_V128_STORE, 0x0b);
+c!(SIMD_I8X16_SHUFFLE, 0x0d);
+c!(SIMD_F32X4_EQ, 0x41);
+c!(SIMD_F32X4_NE, 0x42);
+c!(SIMD_F32X4_LT, 0x43);
+c!(SIMD_F32X4_GT, 0x44);
+c!(SIMD_F32X4_LE, 0x45);
+c!(SIMD_V128_NOT, 0x4d);
+c!(SIMD_V128_AND, 0x4e);
+c!(SIMD_V128_OR, 0x50);
+c!(SIMD_V128_BITSELECT, 0x52);
+c!(SIMD_F32X4_ADD, 0xe4);
+c!(SIMD_F32X4_SUB, 0xe5);
+c!(SIMD_F32X4_MUL, 0xe6);
+c!(SIMD_F32X4_DIV, 0xe7);
