@@ -1747,16 +1747,39 @@ pub unsafe fn instr_660F57_mem(addr: i32, r: i32) {
     instr_660F57(return_on_pagefault!(safe_read128s(addr)), r);
 }
 
+/// SSE's tie-break when both operands of an add or a mul are NaN: the
+/// destination keeps its own NaN (SDM Table 4-7) -- not left to `+`/`*`,
+/// which make no promise about which operand's payload a NaN result
+/// carries, and, on this build, forwards the second operand's.
+#[inline]
+fn sse_binop_f32(destination: f32, source: f32, op: fn(f32, f32) -> f32) -> f32 {
+    if destination.is_nan() && source.is_nan() {
+        destination
+    }
+    else {
+        op(destination, source)
+    }
+}
+#[inline]
+fn sse_binop_f64(destination: f64, source: f64, op: fn(f64, f64) -> f64) -> f64 {
+    if destination.is_nan() && source.is_nan() {
+        destination
+    }
+    else {
+        op(destination, source)
+    }
+}
+
 #[no_mangle]
 pub unsafe fn instr_0F58(source: reg128, r: i32) {
     // addps xmm, xmm/mem128
     let destination = read_xmm128s(r);
     let result = reg128 {
         f32: [
-            destination.f32[0] + source.f32[0],
-            destination.f32[1] + source.f32[1],
-            destination.f32[2] + source.f32[2],
-            destination.f32[3] + source.f32[3],
+            sse_binop_f32(destination.f32[0], source.f32[0], |a, b| a + b),
+            sse_binop_f32(destination.f32[1], source.f32[1], |a, b| a + b),
+            sse_binop_f32(destination.f32[2], source.f32[2], |a, b| a + b),
+            sse_binop_f32(destination.f32[3], source.f32[3], |a, b| a + b),
         ],
     };
     write_xmm_reg128(r, result);
@@ -1785,7 +1808,8 @@ pub unsafe fn instr_660F58_mem(addr: i32, r: i32) {
 pub unsafe fn instr_F20F58(source: u64, r: i32) {
     // addsd xmm, xmm/mem64
     let destination = read_xmm64s(r);
-    write_xmm_f64(r, f64::from_bits(destination) + f64::from_bits(source));
+    let result = sse_binop_f64(f64::from_bits(destination), f64::from_bits(source), |a, b| a + b);
+    write_xmm_f64(r, result);
 }
 pub unsafe fn instr_F20F58_reg(r1: i32, r2: i32) { instr_F20F58(read_xmm64s(r1), r2); }
 pub unsafe fn instr_F20F58_mem(addr: i32, r: i32) {
@@ -1795,7 +1819,7 @@ pub unsafe fn instr_F20F58_mem(addr: i32, r: i32) {
 pub unsafe fn instr_F30F58(source: f32, r: i32) {
     // addss xmm, xmm/mem32
     let destination = read_xmm_f32(r);
-    let result = destination + source;
+    let result = sse_binop_f32(destination, source, |a, b| a + b);
     write_xmm_f32(r, result);
 }
 pub unsafe fn instr_F30F58_reg(r1: i32, r2: i32) { instr_F30F58(read_xmm_f32(r1), r2); }
@@ -1809,10 +1833,10 @@ pub unsafe fn instr_0F59(source: reg128, r: i32) {
     let destination = read_xmm128s(r);
     let result = reg128 {
         f32: [
-            destination.f32[0] * source.f32[0],
-            destination.f32[1] * source.f32[1],
-            destination.f32[2] * source.f32[2],
-            destination.f32[3] * source.f32[3],
+            sse_binop_f32(destination.f32[0], source.f32[0], |a, b| a * b),
+            sse_binop_f32(destination.f32[1], source.f32[1], |a, b| a * b),
+            sse_binop_f32(destination.f32[2], source.f32[2], |a, b| a * b),
+            sse_binop_f32(destination.f32[3], source.f32[3], |a, b| a * b),
         ],
     };
     write_xmm_reg128(r, result);
@@ -1841,7 +1865,8 @@ pub unsafe fn instr_660F59_mem(addr: i32, r: i32) {
 pub unsafe fn instr_F20F59(source: u64, r: i32) {
     // mulsd xmm, xmm/mem64
     let destination = read_xmm64s(r);
-    write_xmm_f64(r, f64::from_bits(destination) * f64::from_bits(source));
+    let result = sse_binop_f64(f64::from_bits(destination), f64::from_bits(source), |a, b| a * b);
+    write_xmm_f64(r, result);
 }
 pub unsafe fn instr_F20F59_reg(r1: i32, r2: i32) { instr_F20F59(read_xmm64s(r1), r2); }
 pub unsafe fn instr_F20F59_mem(addr: i32, r: i32) {
@@ -1851,7 +1876,7 @@ pub unsafe fn instr_F20F59_mem(addr: i32, r: i32) {
 pub unsafe fn instr_F30F59(source: f32, r: i32) {
     // mulss xmm, xmm/mem32
     let destination = read_xmm_f32(r);
-    let result = destination * source;
+    let result = sse_binop_f32(destination, source, |a, b| a * b);
     write_xmm_f32(r, result);
 }
 pub unsafe fn instr_F30F59_reg(r1: i32, r2: i32) { instr_F30F59(read_xmm_f32(r1), r2); }
