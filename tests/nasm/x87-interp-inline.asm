@@ -6,13 +6,17 @@
 ; compiler against one hardware fixture. The last cases are the ones the arm
 ; must decline: a value no double holds, an empty register, and the operands
 ; and results that raise a flag -- a divide by zero, an invalid operation, a
-; NaN -- under each of the three encodings, so the status word is pinned too.
+; NaN -- under each of the three encodings, so the status word is pinned too,
+; and a signalling NaN loaded from memory, which raises the invalid operation
+; on the load itself and lands in the register as a quiet NaN. Every stored
+; status word drops C1, PE, OE and DE, the bits the harness does not compare
+; either, so a fixture pins the bits the emulator implements and no other.
 
 global _start
 
 %include "header.inc"
 
-    sub esp, 256
+    sub esp, 288
 
     mov dword [esp], 0x3fc00000           ; 1.5
     mov dword [esp+4], 0x40100000         ; 2.25
@@ -35,6 +39,9 @@ global _start
     mov dword [esp+52], 0x00000000
     mov dword [esp+56], 0x00000000        ; a quiet NaN as a double
     mov dword [esp+60], 0x7ff80000
+    mov dword [esp+248], 0x7f800001       ; a signalling NaN as a single
+    mov dword [esp+256], 0x00000001       ; a signalling NaN as a double
+    mov dword [esp+260], 0x7ff00000
 
     ; arithmetic against a single in memory
     fld dword [esp]                       ; 1.5
@@ -89,49 +96,59 @@ global _start
     xor eax, eax
     fcom dword [esp+8]
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+120], eax
     xor eax, eax
     fcom qword [esp+24]
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+124], eax
     xor eax, eax
     fcom st1
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+128], eax
     xor eax, eax
     fucom st1
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+132], eax
     xor eax, eax
     fcomp dword [esp]                     ; equal, then popped
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+136], eax
     fld dword [esp+8]                     ; st0 3.0, st1 2.25
     xor eax, eax
     fcomp st1
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+140], eax
     fld dword [esp+8]                     ; st0 3.0, st1 2.25
     xor eax, eax
     fucomp st1
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+144], eax
     fld dword [esp+4]                     ; st0 2.25, st1 2.25
     xor eax, eax
     fcompp
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+148], eax
     fld dword [esp]
     fld dword [esp+4]
     xor eax, eax
     fucompp
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+152], eax
     fld dword [esp+4]
     fld dword [esp]
     xor eax, eax
     fcomp qword [esp+16]
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+156], eax
     fstp st0
 
@@ -142,10 +159,12 @@ global _start
     xor eax, eax
     fucom st1
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+160], eax
     xor eax, eax
     fcom st1
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+164], eax
     fstp st0
     fstp st0
@@ -165,6 +184,7 @@ global _start
     fadd st0, st1
     xor eax, eax
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+172], eax
     fstp st0
 
@@ -176,6 +196,7 @@ global _start
     fdiv dword [esp+44]                   ; / 0.0 single
     xor eax, eax
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+176], eax
     fstp dword [esp+180]
     fnclex
@@ -183,6 +204,7 @@ global _start
     fdiv dword [esp+44]                   ; 0/0
     xor eax, eax
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+184], eax
     fstp dword [esp+188]
     fnclex
@@ -190,6 +212,7 @@ global _start
     fadd dword [esp+12]                   ; + NaN
     xor eax, eax
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+192], eax
     fstp dword [esp+196]
 
@@ -198,6 +221,7 @@ global _start
     fdiv qword [esp+48]                   ; / 0.0 double
     xor eax, eax
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+200], eax
     fstp dword [esp+204]
     fnclex
@@ -205,6 +229,7 @@ global _start
     fdiv qword [esp+48]                   ; 0/0
     xor eax, eax
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+208], eax
     fstp dword [esp+212]
     fnclex
@@ -212,6 +237,7 @@ global _start
     fmul qword [esp+24]                   ; * 1.5
     xor eax, eax
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+216], eax
     fstp dword [esp+220]
 
@@ -221,6 +247,7 @@ global _start
     fdiv st0, st1                         ; 1.5 / 0.0
     xor eax, eax
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+224], eax
     fstp dword [esp+228]
     fstp st0
@@ -230,6 +257,7 @@ global _start
     fdivp st1, st0                        ; 0/0, popped
     xor eax, eax
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+232], eax
     fstp dword [esp+236]
     fnclex
@@ -238,8 +266,26 @@ global _start
     fsub st1, st0                         ; NaN - 1.5
     xor eax, eax
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+240], eax
     fstp st0
     fstp dword [esp+244]
+
+    ; a signalling NaN loaded from memory: invalid on the load, quiet in the
+    ; register, whether the single or the double form
+    fnclex
+    fld dword [esp+248]
+    xor eax, eax
+    fnstsw ax
+    and eax, 0xFDD5
+    mov [esp+264], eax
+    fstp dword [esp+268]
+    fnclex
+    fld qword [esp+256]
+    xor eax, eax
+    fnstsw ax
+    and eax, 0xFDD5
+    mov [esp+272], eax
+    fstp qword [esp+276]
 
 %include "footer.inc"

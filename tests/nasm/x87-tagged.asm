@@ -2,7 +2,9 @@
 ; the constants, the sign changes, a register-to-register store, a square
 ; root, the compares, and the integer loads and stores under each rounding
 ; mode the control word names. Every value here is exact in a double, so the
-; result does not depend on the precision the arithmetic runs at.
+; result does not depend on the precision the arithmetic runs at. Every stored
+; status word drops C1, PE, OE and DE, the bits the harness does not compare
+; either, so the fixture pins the bits the emulator implements and no other.
 
 global _start
 
@@ -74,15 +76,18 @@ global _start
     xor eax, eax
     fcom st1
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+64], eax
     xor eax, eax
     fcomp st1
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+68], eax
     fld dword [esp]                       ; st0 1.5, st1 2.25
     xor eax, eax
     fucompp
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+72], eax
 
     ; the compares against memory, against an integer in memory, and the
@@ -91,15 +96,18 @@ global _start
     xor eax, eax
     fcom dword [esp+4]
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+20], eax
     xor eax, eax
     ficom dword [esp+116]
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+24], eax
     fld dword [esp+4]                     ; st0 2.25, st1 1.5
     xor eax, eax
     fucomp st1
     fnstsw ax
+    and eax, 0xFDD5
     mov [esp+28], eax
     fstp st0
 

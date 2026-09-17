@@ -3235,26 +3235,109 @@ pub fn gen_fpu_push_f64(ctx: &mut JitContext) {
     ctx.builder.free_local_i64(bits);
 }
 
-/// `fld m32`: the single widened to a double and pushed tagged.
+// A load from memory takes the arm on what the arithmetic arms take, a normal
+// or a zero; anything else goes through the library, which is where an SNaN
+// source raises the invalid operation and becomes the QNaN the register
+// holds, and where a NaN, an infinity or a denormal stays in the 80-bit
+// format rather than tagged. The test is on the bits: |x| less the smallest
+// normal is below the span of the normals.
+
+/// Pushes whether the single whose bits are in `bits` is a normal or a zero.
+fn gen_fpu_f32_bits_ok(ctx: &mut JitContext, bits: &WasmLocal) {
+    ctx.builder.get_local(bits);
+    ctx.builder.const_i32(1);
+    ctx.builder.shl_i32();
+    ctx.builder.const_i32(1);
+    ctx.builder.shr_u_i32();
+    let abs = ctx.builder.set_new_local();
+    ctx.builder.const_i32(0x7F00_0000);
+    ctx.builder.get_local(&abs);
+    ctx.builder.const_i32(0x0080_0000);
+    ctx.builder.sub_i32();
+    ctx.builder.gtu_i32();
+    ctx.builder.get_local(&abs);
+    ctx.builder.eqz_i32();
+    ctx.builder.or_i32();
+    ctx.builder.free_local(abs);
+}
+
+/// Pushes whether the double whose bits are in `bits` is a normal or a zero.
+fn gen_fpu_f64_bits_ok(ctx: &mut JitContext, bits: &WasmLocalI64) {
+    ctx.builder.get_local_i64(bits);
+    ctx.builder.const_i64(1);
+    ctx.builder.shl_i64();
+    ctx.builder.const_i64(1);
+    ctx.builder.shr_u_i64();
+    let abs = ctx.builder.set_new_local_i64();
+    ctx.builder.const_i64(0x7FE << 52);
+    ctx.builder.get_local_i64(&abs);
+    ctx.builder.const_i64(-(1 << 52));
+    ctx.builder.add_i64();
+    ctx.builder.gtu_i64();
+    ctx.builder.get_local_i64(&abs);
+    ctx.builder.const_i64(0);
+    ctx.builder.eq_i64();
+    ctx.builder.or_i32();
+    ctx.builder.free_local_i64(abs);
+}
+
+/// `fld m32`: a normal or zero single widened to a double and pushed tagged,
+/// any other pushed by the helper.
 pub fn gen_fpu_push_m32(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     if !crate::jit::fpu_inline_enabled() {
         gen_fpu_load_m32(ctx, modrm_byte);
         ctx.builder.call_fn2_i64_i32("fpu_push");
         return;
     }
-    gen_fpu_load_m32_as_f64(ctx, modrm_byte);
+    gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+    let bits = ctx.builder.set_new_local();
+    gen_fpu_f32_bits_ok(ctx, &bits);
+    ctx.builder.if_void();
+    ctx.builder.get_local(&bits);
+    ctx.builder.reinterpret_i32_as_f32();
+    ctx.builder.promote_f32_to_f64();
     gen_fpu_push_f64(ctx);
+    ctx.builder.else_();
+    ctx.builder
+        .const_i32(global_pointers::sse_scratch_register as i32);
+    ctx.builder.get_local(&bits);
+    ctx.builder.call_fn2("f32_to_f80_jit");
+    ctx.builder
+        .load_fixed_i64(global_pointers::sse_scratch_register as u32);
+    ctx.builder
+        .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
+    ctx.builder.call_fn2_i64_i32("fpu_push");
+    ctx.builder.block_end();
+    ctx.builder.free_local(bits);
 }
 
-/// `fld m64`: the double pushed tagged as it is.
+/// `fld m64`: a normal or zero double pushed tagged as it is, any other
+/// pushed by the helper.
 pub fn gen_fpu_push_m64(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     if !crate::jit::fpu_inline_enabled() {
         gen_fpu_load_m64(ctx, modrm_byte);
         ctx.builder.call_fn2_i64_i32("fpu_push");
         return;
     }
-    gen_fpu_load_m64_as_f64(ctx, modrm_byte);
+    gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+    let bits = ctx.builder.set_new_local_i64();
+    gen_fpu_f64_bits_ok(ctx, &bits);
+    ctx.builder.if_void();
+    ctx.builder.get_local_i64(&bits);
+    ctx.builder.reinterpret_i64_as_f64();
     gen_fpu_push_f64(ctx);
+    ctx.builder.else_();
+    ctx.builder
+        .const_i32(global_pointers::sse_scratch_register as i32);
+    ctx.builder.get_local_i64(&bits);
+    ctx.builder.call_fn2_i32_i64("f64_to_f80_jit");
+    ctx.builder
+        .load_fixed_i64(global_pointers::sse_scratch_register as u32);
+    ctx.builder
+        .load_fixed_u16(global_pointers::sse_scratch_register as u32 + 8);
+    ctx.builder.call_fn2_i64_i32("fpu_push");
+    ctx.builder.block_end();
+    ctx.builder.free_local_i64(bits);
 }
 
 /// `fld st(i)`: a tagged register copied inline, any other pushed by the helper.

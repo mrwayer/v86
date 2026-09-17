@@ -674,10 +674,16 @@ pub unsafe fn fpu_set_status_word(sw: u16) {
     *fpu_stack_ptr = (sw >> 11 & 7) as u8;
 }
 
+// A load from memory takes the arm on what the arithmetic arm takes, a
+// normal or a zero; anything else is the library's, which is where an SNaN
+// source raises the invalid operation and becomes the QNaN the register
+// holds, and where a NaN, an infinity or a denormal stays in the 80-bit
+// format rather than tagged.
 pub unsafe fn fpu_fldm32(addr: i32) {
     let bits = return_on_pagefault!(safe_read32s(addr));
-    if crate::jit::fpu_inline_enabled() {
-        fpu_push_f64(f32::from_bits(bits as u32) as f64, X87_SITE_FLD_M32)
+    let single = f32::from_bits(bits as u32);
+    if crate::jit::fpu_inline_enabled() && (single.is_normal() || single == 0.0) {
+        fpu_push_f64(single as f64, X87_SITE_FLD_M32)
     }
     else {
         fpu_push_at(f32_to_f80(bits), X87_SITE_FLD_M32)
@@ -685,8 +691,9 @@ pub unsafe fn fpu_fldm32(addr: i32) {
 }
 pub unsafe fn fpu_fldm64(addr: i32) {
     let bits = return_on_pagefault!(safe_read64s(addr));
-    if crate::jit::fpu_inline_enabled() {
-        fpu_push_f64(f64::from_bits(bits), X87_SITE_FLD_M64)
+    let double = f64::from_bits(bits);
+    if crate::jit::fpu_inline_enabled() && fpu_arm_ok(double) {
+        fpu_push_f64(double, X87_SITE_FLD_M64)
     }
     else {
         fpu_push_at(f64_to_f80(bits), X87_SITE_FLD_M64)
