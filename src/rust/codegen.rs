@@ -834,12 +834,57 @@ fn gen_flat_read(
         None => return false,
     };
 
+    dbg_assert!((where_to_write != None) == (bits == BitSize::DQWORD));
+
+    // mem8 is read once, at emission time: allocate_memory sets it before any
+    // compile, so it is a compile-time constant here, folded into the load's
+    // offset immediate on the fast arm rather than added to the address at
+    // runtime. The slow arm's reconstructed address already carries mem8 (or
+    // is a scratch-buffer pointer unrelated to it, for the VGA/mapped-range
+    // and page-crossing cases) baked in by the Rust helper it calls, so it
+    // keeps its own load at offset 0 exactly as before -- folding mem8 into
+    // its offset too would require subtracting it back out first, which
+    // underflows for the scratch-buffer case and traps on the reload.
+    let mem8 = unsafe { memory::mem8 } as u32;
+
     gen_flat_range_check(ctx, address_local, span);
-    ctx.builder.if_i32();
+    match bits {
+        BitSize::DQWORD => ctx.builder.if_void(),
+        BitSize::QWORD => ctx.builder.if_i64(),
+        _ => ctx.builder.if_i32(),
+    }
     {
-        ctx.builder.get_local(&address_local);
-        ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
-        ctx.builder.add_i32();
+        gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_FAST);
+        match bits {
+            BitSize::BYTE => {
+                ctx.builder.get_local(&address_local);
+                ctx.builder.load_u8(mem8);
+            },
+            BitSize::WORD => {
+                ctx.builder.get_local(&address_local);
+                ctx.builder.load_unaligned_u16(mem8);
+            },
+            BitSize::DWORD => {
+                ctx.builder.get_local(&address_local);
+                ctx.builder.load_unaligned_i32(mem8);
+            },
+            BitSize::QWORD => {
+                ctx.builder.get_local(&address_local);
+                ctx.builder.load_unaligned_i64(mem8);
+            },
+            BitSize::DQWORD => {
+                let where_to_write = where_to_write.unwrap();
+                ctx.builder.const_i32(0);
+                ctx.builder.get_local(&address_local);
+                ctx.builder.load_unaligned_i64(mem8);
+                ctx.builder.store_unaligned_i64(where_to_write);
+
+                ctx.builder.const_i32(0);
+                ctx.builder.get_local(&address_local);
+                ctx.builder.load_unaligned_i64(mem8 + 8);
+                ctx.builder.store_unaligned_i64(where_to_write + 8);
+            },
+        }
     }
     ctx.builder.else_();
     {
@@ -886,41 +931,41 @@ fn gen_flat_read(
         ctx.builder.get_local(&address_local);
         ctx.builder.xor_i32();
         ctx.builder.free_local(entry_local);
+
+        gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_FAST);
+
+        match bits {
+            BitSize::BYTE => {
+                ctx.builder.load_u8(0);
+            },
+            BitSize::WORD => {
+                ctx.builder.load_unaligned_u16(0);
+            },
+            BitSize::DWORD => {
+                ctx.builder.load_unaligned_i32(0);
+            },
+            BitSize::QWORD => {
+                ctx.builder.load_unaligned_i64(0);
+            },
+            BitSize::DQWORD => {
+                let where_to_write = where_to_write.unwrap();
+                let phys_address_local = ctx.builder.set_new_local();
+                ctx.builder.const_i32(0);
+                ctx.builder.get_local(&phys_address_local);
+                ctx.builder.load_unaligned_i64(0);
+                ctx.builder.store_unaligned_i64(where_to_write);
+
+                ctx.builder.const_i32(0);
+                ctx.builder.get_local(&phys_address_local);
+                ctx.builder.load_unaligned_i64(8);
+                ctx.builder.store_unaligned_i64(where_to_write + 8);
+
+                ctx.builder.free_local(phys_address_local);
+            },
+        }
     }
     ctx.builder.block_end();
 
-    gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_READ_FAST);
-
-    dbg_assert!((where_to_write != None) == (bits == BitSize::DQWORD));
-    match bits {
-        BitSize::BYTE => {
-            ctx.builder.load_u8(0);
-        },
-        BitSize::WORD => {
-            ctx.builder.load_unaligned_u16(0);
-        },
-        BitSize::DWORD => {
-            ctx.builder.load_unaligned_i32(0);
-        },
-        BitSize::QWORD => {
-            ctx.builder.load_unaligned_i64(0);
-        },
-        BitSize::DQWORD => {
-            let where_to_write = where_to_write.unwrap();
-            let phys_address_local = ctx.builder.set_new_local();
-            ctx.builder.const_i32(0);
-            ctx.builder.get_local(&phys_address_local);
-            ctx.builder.load_unaligned_i64(0);
-            ctx.builder.store_unaligned_i64(where_to_write);
-
-            ctx.builder.const_i32(0);
-            ctx.builder.get_local(&phys_address_local);
-            ctx.builder.load_unaligned_i64(8);
-            ctx.builder.store_unaligned_i64(where_to_write + 8);
-
-            ctx.builder.free_local(phys_address_local);
-        },
-    }
     true
 }
 
@@ -1168,12 +1213,18 @@ fn gen_flat_write(
         None => return false,
     };
 
+    // See gen_flat_read: mem8 folds into the fast arm's own store, at its
+    // offset immediate; the slow arm keeps calling gen_store, whose offset-0
+    // store fits the address gen_store's caller already computed (baked-in
+    // mem8 for plain RAM, or a scratch-buffer pointer unrelated to mem8 for
+    // the VGA/mapped-range and page-crossing cases) -- unchanged.
+    let mem8 = unsafe { memory::mem8 } as u32;
+
     gen_flat_write_check(ctx, bits, address_local, span);
-    ctx.builder.if_i32();
+    ctx.builder.if_void();
     {
-        ctx.builder.get_local(address_local);
-        ctx.builder.const_i32(unsafe { memory::mem8 } as i32);
-        ctx.builder.add_i32();
+        gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_WRITE_FAST);
+        gen_store_at(ctx, bits, address_local, mem8, value_local);
     }
     ctx.builder.else_();
     {
@@ -1232,13 +1283,60 @@ fn gen_flat_write(
         ctx.builder.get_local(address_local);
         ctx.builder.xor_i32();
         ctx.builder.free_local(entry_local);
+
+        gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_WRITE_FAST);
+
+        gen_store(ctx, bits, value_local);
     }
     ctx.builder.block_end();
-
-    gen_profiler_stat_increment(ctx.builder, profiler::stat::SAFE_WRITE_FAST);
-
-    gen_store(ctx, bits, value_local);
     true
+}
+
+/// Stores the value at `address_local + offset`: the fast arm's own store,
+/// with mem8 folded into the offset immediate instead of added at runtime.
+fn gen_store_at(
+    ctx: &mut JitContext,
+    bits: BitSize,
+    address_local: &WasmLocal,
+    offset: u32,
+    value_local: GenSafeWriteValue,
+) {
+    match value_local {
+        GenSafeWriteValue::I32(local) => {
+            ctx.builder.get_local(address_local);
+            ctx.builder.get_local(local);
+        },
+        GenSafeWriteValue::I64(local) => {
+            ctx.builder.get_local(address_local);
+            ctx.builder.get_local_i64(local);
+        },
+        GenSafeWriteValue::TwoI64s(local1, local2) => {
+            assert!(bits == BitSize::DQWORD);
+
+            ctx.builder.get_local(address_local);
+            ctx.builder.get_local_i64(local1);
+            ctx.builder.store_unaligned_i64(offset);
+
+            ctx.builder.get_local(address_local);
+            ctx.builder.get_local_i64(local2);
+            ctx.builder.store_unaligned_i64(offset + 8);
+        },
+    }
+    match bits {
+        BitSize::BYTE => {
+            ctx.builder.store_u8(offset);
+        },
+        BitSize::WORD => {
+            ctx.builder.store_unaligned_u16(offset);
+        },
+        BitSize::DWORD => {
+            ctx.builder.store_unaligned_i32(offset);
+        },
+        BitSize::QWORD => {
+            ctx.builder.store_unaligned_i64(offset);
+        },
+        BitSize::DQWORD => {}, // handled above
+    }
 }
 
 /// Stores the value at the physical address on the stack.
