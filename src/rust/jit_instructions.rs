@@ -248,6 +248,8 @@ enum PackedF32Op {
     Div,
     Min,
     Max,
+    Compare(u32),
+    Shuffle(u32),
 }
 
 fn gen_load_v128(ctx: &mut JitContext, addr: u32) {
@@ -294,6 +296,63 @@ fn gen_packed_f32(ctx: &mut JitContext, source: u32, r: u32, op: PackedF32Op) {
                 ctx.builder.gt_f32x4()
             }
             ctx.builder.bitselect_v128();
+        },
+        // Only the low three bits of the predicate are the instruction's.
+        PackedF32Op::Compare(predicate) => match predicate & 7 {
+            // Unordered: a NaN on either side; ordered: on neither. A value
+            // that does not equal itself is a NaN.
+            unordered @ (3 | 7) => {
+                gen_load_v128(ctx, dest);
+                gen_load_v128(ctx, dest);
+                if unordered == 3 {
+                    ctx.builder.ne_f32x4()
+                }
+                else {
+                    ctx.builder.eq_f32x4()
+                }
+                gen_load_v128(ctx, source);
+                gen_load_v128(ctx, source);
+                if unordered == 3 {
+                    ctx.builder.ne_f32x4();
+                    ctx.builder.or_v128()
+                }
+                else {
+                    ctx.builder.eq_f32x4();
+                    ctx.builder.and_v128()
+                }
+            },
+            predicate => {
+                gen_load_v128(ctx, dest);
+                gen_load_v128(ctx, source);
+                match predicate {
+                    0 => ctx.builder.eq_f32x4(),
+                    1 => ctx.builder.lt_f32x4(),
+                    2 => ctx.builder.le_f32x4(),
+                    4 => ctx.builder.ne_f32x4(),
+                    5 => {
+                        ctx.builder.lt_f32x4();
+                        ctx.builder.not_v128()
+                    },
+                    _ => {
+                        ctx.builder.le_f32x4();
+                        ctx.builder.not_v128()
+                    },
+                }
+            },
+        },
+        // The low two lanes from the destination, the high two from the
+        // source, each chosen by two bits of the immediate.
+        PackedF32Op::Shuffle(imm8) => {
+            gen_load_v128(ctx, dest);
+            gen_load_v128(ctx, source);
+            let mut lanes = [0u8; 16];
+            for lane in 0..4 {
+                let from = (imm8 >> 2 * lane & 3) as u8 * 4 + if lane < 2 { 0 } else { 16 };
+                for byte in 0..4 {
+                    lanes[lane * 4 + byte] = from + byte as u8;
+                }
+            }
+            ctx.builder.shuffle_i8x16(&lanes);
         },
     }
     ctx.builder.store_aligned_v128(0);
@@ -5573,10 +5632,10 @@ pub fn instr32_0FC7_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 pub fn instr32_0FC7_1_reg_jit(ctx: &mut JitContext, _r: u32) { codegen::gen_trigger_ud(ctx); }
 
 pub fn instr_0FC2_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32, imm8: u32) {
-    sse_read128_xmm_xmm_imm(ctx, "instr_0FC2", r1, r2, imm8)
+    sse_packed_f32_xmm_xmm(ctx, r1, r2, PackedF32Op::Compare(imm8))
 }
 pub fn instr_0FC2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32, imm8: u32) {
-    sse_read128_xmm_mem_imm(ctx, "instr_0FC2", modrm_byte, r, imm8)
+    sse_packed_f32_xmm_mem(ctx, modrm_byte, r, PackedF32Op::Compare(imm8))
 }
 pub fn instr_660FC2_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32, imm8: u32) {
     sse_read128_xmm_xmm_imm(ctx, "instr_660FC2", r1, r2, imm8)
@@ -5614,10 +5673,10 @@ pub fn instr_F30FC2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32,
 }
 
 pub fn instr_0FC6_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32, imm8: u32) {
-    sse_read128_xmm_xmm_imm(ctx, "instr_0FC6", r1, r2, imm8)
+    sse_packed_f32_xmm_xmm(ctx, r1, r2, PackedF32Op::Shuffle(imm8))
 }
 pub fn instr_0FC6_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32, imm8: u32) {
-    sse_read128_xmm_mem_imm(ctx, "instr_0FC6", modrm_byte, r, imm8)
+    sse_packed_f32_xmm_mem(ctx, modrm_byte, r, PackedF32Op::Shuffle(imm8))
 }
 pub fn instr_660FC6_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32, imm8: u32) {
     sse_read128_xmm_xmm_imm(ctx, "instr_660FC6", r1, r2, imm8)
