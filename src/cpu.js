@@ -1010,6 +1010,11 @@ CPU.prototype.init = function(settings, device_bus)
         this.set_jit_config(0, 1);
     }
 
+    if(settings.jit_dead_flags)
+    {
+        this.set_jit_config(8, 1);
+    }
+
     settings.cpuid_level && this.set_cpuid_level(settings.cpuid_level);
 
     this.acpi_enabled[0] = +settings.acpi;

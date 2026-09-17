@@ -315,6 +315,13 @@ nasmtests-force-jit: build/v86-debug.wasm
 	$(NASM_TEST_DIR)/gen_fixtures.js
 	$(NASM_TEST_DIR)/run.js --force-jit
 
+# Same suite, with JIT_DEAD_FLAGS (jit config index 8) on: pins that the
+# pass never changes what a reader sees, only which writer records it skips.
+nasmtests-force-jit-dead-flags: build/v86-debug.wasm
+	$(NASM_TEST_DIR)/create_tests.js
+	$(NASM_TEST_DIR)/gen_fixtures.js
+	JIT_DEAD_FLAGS=1 $(NASM_TEST_DIR)/run.js --force-jit
+
 jitpagingtests: build/v86-debug.wasm
 	$(MAKE) -C tests/jit-paging test-jit test-jit-smc
 	./tests/jit-paging/run.js
