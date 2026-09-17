@@ -235,10 +235,10 @@ fn sse_mov_xmm_xmm(ctx: &mut JitContext, r1: u32, r2: u32) {
 // The packed single-precision forms, done where the registers lie: the
 // destination's four lanes against the source's in one v128 instruction,
 // where a helper copied the source aside, walked the lanes and wrote the
-// register back. Measured on a title's level: the helper-bound packed forms
-// were forty million per twenty seconds, an eighth of the compiled time.
-// The operands go on the stack in the order the helpers took them, so that
-// a NaN chosen between two comes from the same side as before.
+// register back. The destination goes on the stack first for add and mul
+// too, not just sub and div: wasm's own lowering keeps its first operand's
+// NaN when both lanes are NaN, matching SSE's own "destination wins" rule
+// (SDM Table 4-7) only if the destination is pushed first.
 
 #[derive(Copy, Clone)]
 enum PackedF32Op {
@@ -262,8 +262,8 @@ fn gen_packed_f32(ctx: &mut JitContext, source: u32, r: u32, op: PackedF32Op) {
     ctx.builder.const_i32(dest as i32);
     match op {
         PackedF32Op::Add | PackedF32Op::Mul => {
-            gen_load_v128(ctx, source);
             gen_load_v128(ctx, dest);
+            gen_load_v128(ctx, source);
             if matches!(op, PackedF32Op::Add) {
                 ctx.builder.add_f32x4()
             }
@@ -411,9 +411,9 @@ fn gen_scalar_f32(ctx: &mut JitContext, source: ScalarSource, r: u32, op: Scalar
     ctx.builder.const_i32(dest as i32);
     match op {
         ScalarOp::Add | ScalarOp::Mul => {
-            push_source(ctx);
             ctx.builder.const_i32(dest as i32);
             ctx.builder.load_aligned_f32(0);
+            push_source(ctx);
             if matches!(op, ScalarOp::Add) {
                 ctx.builder.add_f32()
             }
@@ -463,9 +463,9 @@ fn gen_scalar_f64(ctx: &mut JitContext, source: ScalarSource, r: u32, op: Scalar
     ctx.builder.const_i32(dest as i32);
     match op {
         ScalarOp::Add | ScalarOp::Mul => {
-            push_source(ctx);
             ctx.builder.const_i32(dest as i32);
             ctx.builder.load_aligned_f64(0);
+            push_source(ctx);
             if matches!(op, ScalarOp::Add) {
                 ctx.builder.add_f64()
             }
