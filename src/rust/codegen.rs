@@ -2985,9 +2985,7 @@ pub enum FpuFastBinOp {
 /// addresses more than one register from it reads twice: not a fresh local
 /// and never freed by the caller, since it is the same local the module
 /// frees once at every exit.
-fn gen_fpu_top(ctx: &mut JitContext) -> WasmLocal {
-    ctx.fpu_stack_ptr_local.unsafe_clone()
-}
+fn gen_fpu_top(ctx: &mut JitContext) -> WasmLocal { ctx.fpu_stack_ptr_local.unsafe_clone() }
 
 /// The physical index (0..7) and the byte address of st(i) in the register
 /// file, both in fresh locals, from the top in `top`. The pointer is kept
@@ -4319,7 +4317,8 @@ pub fn gen_fpu_sync_out(ctx: &mut JitContext) {
     ctx.builder.const_i32(global_pointers::fpu_stack_ptr as i32);
     ctx.builder.get_local(&ctx.fpu_stack_ptr_local);
     ctx.builder.store_u8(0);
-    ctx.builder.const_i32(global_pointers::fpu_stack_empty as i32);
+    ctx.builder
+        .const_i32(global_pointers::fpu_stack_empty as i32);
     ctx.builder.get_local(&ctx.fpu_stack_empty_local);
     ctx.builder.store_u8(0);
 }
