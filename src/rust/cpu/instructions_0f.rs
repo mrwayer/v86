@@ -2997,6 +2997,8 @@ pub unsafe fn instr_660F76_mem(addr: i32, r: i32) {
 pub unsafe fn instr_0F77() {
     // emms
     fpu_set_tag_word(0xFFFF);
+    // AMD APM Vol. 1 §5.12: every 64-bit media instruction clears TOP, EMMS included.
+    *fpu_stack_ptr = 0;
 }
 
 #[no_mangle]
