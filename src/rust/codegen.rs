@@ -2987,10 +2987,17 @@ fn gen_fpu_top(ctx: &mut JitContext) -> WasmLocal {
     ctx.builder.set_new_local()
 }
 
-/// The address of st(i) in the register file, in a local, from the top in
-/// `top`. The pointer is kept below eight by everything that writes it, so
-/// st(0) needs no mask.
-fn gen_fpu_st_addr_from(ctx: &mut JitContext, top: &WasmLocal, i: u32) -> WasmLocal {
+/// The physical index (0..7) and the byte address of st(i) in the register
+/// file, both in fresh locals, from the top in `top`. The pointer is kept
+/// below eight by everything that writes it, so st(0) needs no mask.
+/// `gen_fpu_tag_ok` wants the index too -- deriving it back out of the
+/// address costs more than keeping it, since every caller of the address
+/// already has (or can cheaply have) the index on hand.
+fn gen_fpu_st_index_addr_from(
+    ctx: &mut JitContext,
+    top: &WasmLocal,
+    i: u32,
+) -> (WasmLocal, WasmLocal) {
     ctx.builder.get_local(top);
     if i != 0 {
         ctx.builder.const_i32(i as i32);
@@ -2998,33 +3005,49 @@ fn gen_fpu_st_addr_from(ctx: &mut JitContext, top: &WasmLocal, i: u32) -> WasmLo
         ctx.builder.const_i32(7);
         ctx.builder.and_i32();
     }
+    let index = ctx.builder.tee_new_local();
+    ctx.builder.get_local(&index);
     ctx.builder.const_i32(16);
     ctx.builder.mul_i32();
     ctx.builder.const_i32(global_pointers::fpu_st as i32);
     ctx.builder.add_i32();
-    ctx.builder.set_new_local()
+    let addr = ctx.builder.set_new_local();
+    (index, addr)
 }
 
-/// The address of st(i) in the register file, in a local.
-fn gen_fpu_st_addr(ctx: &mut JitContext, i: u32) -> WasmLocal {
+/// The physical index and byte address of st(i) in the register file, both
+/// in locals.
+fn gen_fpu_st_index_addr(ctx: &mut JitContext, i: u32) -> (WasmLocal, WasmLocal) {
     let top = gen_fpu_top(ctx);
-    let addr = gen_fpu_st_addr_from(ctx, &top, i);
+    let result = gen_fpu_st_index_addr_from(ctx, &top, i);
     ctx.builder.free_local(top);
-    addr
+    result
 }
 
-/// Pushes whether the register at `addr` holds a tagged double: its tag word
-/// reads the marker generated code writes. Every writer that marks a slot
-/// empty (`fpu_pop`/`gen_fpu_pop`, `ffree`, `finit`, `fpu_set_tag_word`,
-/// `fldenv`/`frstor`/`fxrstor`) also clears that slot's tag word, so a
-/// register hardware sees as empty never carries the tag on this side
-/// either, and the tag word alone is the whole answer -- no separate
-/// empty-bit read.
-fn gen_fpu_tag_ok(ctx: &mut JitContext, addr: &WasmLocal) {
+/// Pushes whether the register at `addr`/`index` holds a tagged double: not
+/// marked empty, and its tag word reads the marker generated code writes.
+/// A pop leaves the tag word of the register it emptied unchanged -- real
+/// hardware leaves a popped register's bits standing too (fsave-style
+/// introspection, and this suite's own register comparisons, still read
+/// them), so clearing it on every writer is not an option and the empty bit
+/// stays part of the answer. What earlier cost here was recovering the
+/// index from the address (`(addr - fpu_st) >> 4`) purely to read that bit;
+/// every caller already has the index from computing the address in the
+/// first place, so passing it removes that recovery instead.
+fn gen_fpu_tag_ok(ctx: &mut JitContext, addr: &WasmLocal, index: &WasmLocal) {
+    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+    ctx.builder.get_local(index);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(1);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+
     ctx.builder.get_local(addr);
     ctx.builder.load_unaligned_u16(8);
     ctx.builder.const_i32(FPU_RELAXED_TAG);
     ctx.builder.eq_i32();
+
+    ctx.builder.and_i32();
 }
 
 fn gen_fpu_load_tagged_f64(ctx: &mut JitContext, addr: &WasmLocal) {
@@ -3200,7 +3223,7 @@ pub fn gen_fpu_binop_mem(
     }
     let modrm_slow = modrm_byte.clone();
     let done = ctx.builder.block_void();
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    let (st0_index, st0_addr) = gen_fpu_st_index_addr(ctx, 0);
     let bits = match kind {
         FpuMemOperand::F32 | FpuMemOperand::I32 => {
             gen_modrm_resolve_safe_read32(ctx, modrm_byte);
@@ -3216,7 +3239,7 @@ pub fn gen_fpu_binop_mem(
             FpuMemBits::Narrow(ctx.builder.set_new_local())
         },
     };
-    gen_fpu_tag_ok(ctx, &st0_addr);
+    gen_fpu_tag_ok(ctx, &st0_addr, &st0_index);
     match (kind, &bits) {
         (FpuMemOperand::F32, FpuMemBits::Narrow(bits)) => {
             gen_fpu_f32_bits_ok(ctx, bits);
@@ -3257,6 +3280,7 @@ pub fn gen_fpu_binop_mem(
     );
     ctx.builder.block_end();
     ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(st0_index);
     match bits {
         FpuMemBits::Narrow(bits) => ctx.builder.free_local(bits),
         FpuMemBits::Wide(bits) => ctx.builder.free_local_i64(bits),
@@ -3291,11 +3315,11 @@ pub fn gen_fpu_binop_sti(
     }
     let done = ctx.builder.block_void();
     let top = gen_fpu_top(ctx);
-    let st0_addr = gen_fpu_st_addr_from(ctx, &top, 0);
-    let op_addr = gen_fpu_st_addr_from(ctx, &top, sti);
+    let (st0_index, st0_addr) = gen_fpu_st_index_addr_from(ctx, &top, 0);
+    let (op_index, op_addr) = gen_fpu_st_index_addr_from(ctx, &top, sti);
     ctx.builder.free_local(top);
-    gen_fpu_tag_ok(ctx, &st0_addr);
-    gen_fpu_tag_ok(ctx, &op_addr);
+    gen_fpu_tag_ok(ctx, &st0_addr, &st0_index);
+    gen_fpu_tag_ok(ctx, &op_addr, &op_index);
     ctx.builder.and_i32();
     ctx.builder.if_void();
     gen_fpu_binop_operands(ctx, op, &st0_addr, &mut |ctx| gen_fpu_load_tagged_f64(ctx, &op_addr));
@@ -3306,16 +3330,16 @@ pub fn gen_fpu_binop_sti(
     gen_note_tag_lost(ctx.builder, X87_SITE_ARM_BINOP_STI);
     ctx.builder.block_end();
     ctx.builder.free_local(op_addr);
+    ctx.builder.free_local(op_index);
     ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(st0_index);
     ctx.builder.const_i32(target_sti as i32);
     gen_fpu_get_sti(ctx, sti);
     ctx.builder.call_fn3_i32_i64_i32(helper);
     ctx.builder.block_end();
 }
 
-/// Pops the stack: the top slot marked empty, its tag word cleared so it
-/// does not go on reading as the tagged double it may still hold, and the
-/// pointer moved on.
+/// Pops the stack: the top slot marked empty and the pointer moved on.
 pub fn gen_fpu_pop(ctx: &mut JitContext) {
     if !crate::jit::fpu_inline_enabled() {
         ctx.builder.call_fn0("fpu_pop");
@@ -3330,12 +3354,6 @@ pub fn gen_fpu_pop(ctx: &mut JitContext) {
     ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
     ctx.builder.or_i32();
     ctx.builder.store_u8(0);
-    ctx.builder.get_local(&ptr);
-    ctx.builder.const_i32(16);
-    ctx.builder.mul_i32();
-    ctx.builder.const_i32(0);
-    ctx.builder
-        .store_unaligned_u16(global_pointers::fpu_st as u32 + 8);
     ctx.builder.const_i32(global_pointers::fpu_stack_ptr as i32);
     ctx.builder.get_local(&ptr);
     ctx.builder.const_i32(1);
@@ -3498,8 +3516,8 @@ pub fn gen_fpu_push_sti(ctx: &mut JitContext, sti: u32) {
         ctx.builder.call_fn2_i64_i32("fpu_push");
         return;
     }
-    let addr = gen_fpu_st_addr(ctx, sti);
-    gen_fpu_tag_ok(ctx, &addr);
+    let (index, addr) = gen_fpu_st_index_addr(ctx, sti);
+    gen_fpu_tag_ok(ctx, &addr, &index);
     ctx.builder.if_void();
     gen_fpu_load_tagged_f64(ctx, &addr);
     gen_fpu_push_f64(ctx);
@@ -3509,6 +3527,7 @@ pub fn gen_fpu_push_sti(ctx: &mut JitContext, sti: u32) {
     ctx.builder.call_fn2_i64_i32("fpu_push");
     ctx.builder.block_end();
     ctx.builder.free_local(addr);
+    ctx.builder.free_local(index);
 }
 
 /// `fst m32` / `fstp m32`: a tagged st(0) narrowed and stored inline.
@@ -3517,8 +3536,8 @@ pub fn gen_fpu_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
     let address_local = ctx.builder.set_new_local();
     if crate::jit::fpu_inline_enabled() {
         let done = ctx.builder.block_void();
-        let st0_addr = gen_fpu_st_addr(ctx, 0);
-        gen_fpu_tag_ok(ctx, &st0_addr);
+        let (st0_index, st0_addr) = gen_fpu_st_index_addr(ctx, 0);
+        gen_fpu_tag_ok(ctx, &st0_addr, &st0_index);
         ctx.builder.if_void();
         ctx.builder.get_local(&st0_addr);
         ctx.builder.load_unaligned_i64(0);
@@ -3538,6 +3557,7 @@ pub fn gen_fpu_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
         gen_note_tag_lost(ctx.builder, X87_SITE_ARM_STORE_M32);
         ctx.builder.block_end();
         ctx.builder.free_local(st0_addr);
+        ctx.builder.free_local(st0_index);
         gen_fpu_get_sti(ctx, 0);
         ctx.builder.call_fn2_i64_i32_ret("f80_to_f32");
         let value_local = ctx.builder.set_new_local();
@@ -3563,8 +3583,8 @@ pub fn gen_fpu_store_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
     gen_modrm_resolve(ctx, modrm_byte);
     let address_local = ctx.builder.set_new_local();
     if crate::jit::fpu_inline_enabled() {
-        let st0_addr = gen_fpu_st_addr(ctx, 0);
-        gen_fpu_tag_ok(ctx, &st0_addr);
+        let (st0_index, st0_addr) = gen_fpu_st_index_addr(ctx, 0);
+        gen_fpu_tag_ok(ctx, &st0_addr, &st0_index);
         ctx.builder.if_void();
         ctx.builder.get_local(&st0_addr);
         ctx.builder.load_unaligned_i64(0);
@@ -3580,6 +3600,7 @@ pub fn gen_fpu_store_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool)
         ctx.builder.free_local_i64(value_local);
         ctx.builder.block_end();
         ctx.builder.free_local(st0_addr);
+        ctx.builder.free_local(st0_index);
     }
     else {
         gen_fpu_get_sti(ctx, 0);
@@ -3652,11 +3673,11 @@ pub fn gen_fpu_fxch(ctx: &mut JitContext, i: u32) {
         return;
     }
     let top = gen_fpu_top(ctx);
-    let st0_addr = gen_fpu_st_addr_from(ctx, &top, 0);
-    let sti_addr = gen_fpu_st_addr_from(ctx, &top, i);
+    let (st0_index, st0_addr) = gen_fpu_st_index_addr_from(ctx, &top, 0);
+    let (sti_index, sti_addr) = gen_fpu_st_index_addr_from(ctx, &top, i);
     ctx.builder.free_local(top);
-    gen_fpu_tag_ok(ctx, &st0_addr);
-    gen_fpu_tag_ok(ctx, &sti_addr);
+    gen_fpu_tag_ok(ctx, &st0_addr, &st0_index);
+    gen_fpu_tag_ok(ctx, &sti_addr, &sti_index);
     ctx.builder.and_i32();
     ctx.builder.if_void();
     ctx.builder.get_local(&st0_addr);
@@ -3675,7 +3696,9 @@ pub fn gen_fpu_fxch(ctx: &mut JitContext, i: u32) {
     gen_fn1_const(ctx.builder, "fpu_fxch", i);
     ctx.builder.block_end();
     ctx.builder.free_local(sti_addr);
+    ctx.builder.free_local(sti_index);
     ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(st0_index);
 }
 
 /// `fld1`, `fldz`, `fldpi` and the rest of the group: the constant pushed as a
@@ -3709,8 +3732,8 @@ pub fn gen_fpu_sign_op(ctx: &mut JitContext, r: u32, absolute: bool) {
         gen_fn1_const(ctx.builder, "instr16_D9_4_reg", r);
         return;
     }
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
-    gen_fpu_tag_ok(ctx, &st0_addr);
+    let (st0_index, st0_addr) = gen_fpu_st_index_addr(ctx, 0);
+    gen_fpu_tag_ok(ctx, &st0_addr, &st0_index);
     ctx.builder.if_void();
     gen_fpu_load_tagged_f64(ctx, &st0_addr);
     if absolute {
@@ -3725,6 +3748,7 @@ pub fn gen_fpu_sign_op(ctx: &mut JitContext, r: u32, absolute: bool) {
     gen_fn1_const(ctx.builder, "instr16_D9_4_reg", r);
     ctx.builder.block_end();
     ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(st0_index);
 }
 
 /// `fsqrt`: the root taken at the precision the arithmetic already runs at,
@@ -3737,8 +3761,8 @@ pub fn gen_fpu_fsqrt(ctx: &mut JitContext, r: u32) {
         return;
     }
     let done = ctx.builder.block_void();
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
-    gen_fpu_tag_ok(ctx, &st0_addr);
+    let (st0_index, st0_addr) = gen_fpu_st_index_addr(ctx, 0);
+    gen_fpu_tag_ok(ctx, &st0_addr, &st0_index);
     ctx.builder.if_void();
     gen_fpu_load_tagged_f64(ctx, &st0_addr);
     ctx.builder.sqrt_f64();
@@ -3747,6 +3771,7 @@ pub fn gen_fpu_fsqrt(ctx: &mut JitContext, r: u32) {
     gen_note_tag_lost(ctx.builder, X87_SITE_ARM_FSQRT);
     ctx.builder.block_end();
     ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(st0_index);
     gen_fn1_const(ctx.builder, "instr16_D9_7_reg", r);
     ctx.builder.block_end();
 }
@@ -3759,8 +3784,8 @@ pub fn gen_fpu_fst_sti(ctx: &mut JitContext, i: u32, pop: bool) {
         gen_fn1_const(ctx.builder, helper, i);
         return;
     }
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
-    gen_fpu_tag_ok(ctx, &st0_addr);
+    let (st0_index, st0_addr) = gen_fpu_st_index_addr(ctx, 0);
+    gen_fpu_tag_ok(ctx, &st0_addr, &st0_index);
     ctx.builder.if_void();
     let index = gen_fpu_st_index(ctx, i);
     let dst = gen_fpu_addr_of_index(ctx, &index);
@@ -3794,6 +3819,7 @@ pub fn gen_fpu_fst_sti(ctx: &mut JitContext, i: u32, pop: bool) {
     gen_fn1_const(ctx.builder, helper, i);
     ctx.builder.block_end();
     ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(st0_index);
 }
 
 /// What an x87 memory operand holds.
@@ -3926,11 +3952,11 @@ pub fn gen_fpu_fcom_sti(
         return;
     }
     let top = gen_fpu_top(ctx);
-    let st0_addr = gen_fpu_st_addr_from(ctx, &top, 0);
-    let sti_addr = gen_fpu_st_addr_from(ctx, &top, sti);
+    let (st0_index, st0_addr) = gen_fpu_st_index_addr_from(ctx, &top, 0);
+    let (sti_index, sti_addr) = gen_fpu_st_index_addr_from(ctx, &top, sti);
     ctx.builder.free_local(top);
-    gen_fpu_tag_ok(ctx, &st0_addr);
-    gen_fpu_tag_ok(ctx, &sti_addr);
+    gen_fpu_tag_ok(ctx, &st0_addr, &st0_index);
+    gen_fpu_tag_ok(ctx, &sti_addr, &sti_index);
     ctx.builder.and_i32();
     ctx.builder.if_void();
     ctx.builder.get_local(&st0_addr);
@@ -3950,7 +3976,9 @@ pub fn gen_fpu_fcom_sti(
     helper(ctx);
     ctx.builder.block_end();
     ctx.builder.free_local(sti_addr);
+    ctx.builder.free_local(sti_index);
     ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(st0_index);
 }
 
 /// A compare against memory, inline when st(0) carries the tag.
@@ -3968,8 +3996,8 @@ pub fn gen_fpu_fcom_mem(
         return;
     }
     let modrm_slow = modrm_byte.clone();
-    let st0_addr = gen_fpu_st_addr(ctx, 0);
-    gen_fpu_tag_ok(ctx, &st0_addr);
+    let (st0_index, st0_addr) = gen_fpu_st_index_addr(ctx, 0);
+    gen_fpu_tag_ok(ctx, &st0_addr, &st0_index);
     ctx.builder.if_void();
     ctx.builder.get_local(&st0_addr);
     ctx.builder.load_unaligned_i64(0);
@@ -3989,6 +4017,7 @@ pub fn gen_fpu_fcom_mem(
     ctx.builder.call_fn2_i64_i32(helper);
     ctx.builder.block_end();
     ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(st0_index);
 }
 
 /// The double in `value` rounded to an integer the way the control word's
@@ -4043,8 +4072,8 @@ pub fn gen_fpu_store_int(
             (-32768.0, 32767.0)
         };
         let done = ctx.builder.block_void();
-        let st0_addr = gen_fpu_st_addr(ctx, 0);
-        gen_fpu_tag_ok(ctx, &st0_addr);
+        let (st0_index, st0_addr) = gen_fpu_st_index_addr(ctx, 0);
+        gen_fpu_tag_ok(ctx, &st0_addr, &st0_index);
         ctx.builder.if_void();
         ctx.builder.get_local(&st0_addr);
         ctx.builder.load_unaligned_i64(0);
@@ -4083,6 +4112,7 @@ pub fn gen_fpu_store_int(
         gen_note_tag_lost(ctx.builder, X87_SITE_ARM_STORE_INT);
         ctx.builder.block_end();
         ctx.builder.free_local(st0_addr);
+        ctx.builder.free_local(st0_index);
         gen_fpu_store_int_by_helper(ctx, &address_local, wide, pop, helper);
         ctx.builder.block_end();
     }

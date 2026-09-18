@@ -1,14 +1,17 @@
-; The invariant this branch adds: a writer that marks an x87 register empty
-; (fpu_pop, fpu_ffree, fninit, ...) also clears that register's tag word, so
-; gen_fpu_tag_ok and the interpreter's fpu_tagged can trust the tag word
-; alone rather than also reading the empty bit a pop would otherwise leave
-; stale. Each block below tags a register, empties it through one writer
-; without reloading it, then compares a still-valid register against it by
-; index -- which must read as unordered (the stack-fault bits set) rather
-; than as an ordinary numeric compare, since the writer's own tag word is
-; what generated code trusts. The last block reloads the slot a pop just
+; A pop or an ffree leaves the tag word of the register it emptied standing
+; -- real hardware leaves a popped register's bits standing too, which
+; fsave-style introspection still reads, so the tag word is never the whole
+; answer generated code trusts. gen_fpu_tag_ok reads the register's index
+; and its tag word both, cheaply, from an index the caller already holds
+; rather than one recovered from the address; this pins that the decision
+; the two together reach is still the right one for every writer that marks
+; a slot empty. Each block below tags a register, empties it through one
+; writer without reloading it, then compares a still-valid register against
+; the emptied slot by index -- which must read as unordered (the
+; stack-fault bits set) rather than as an ordinary numeric compare on the
+; stale bits standing there. The last block reloads the slot a pop just
 ; freed and reads it inline, pinning that the ordinary reload-and-use path
-; still works once the empty check is gone from it.
+; is unaffected.
 ;
 ; Every stored status word drops C1, PE, OE and DE, the bits the harness
 ; does not compare either, so the fixture pins the bits the emulator
@@ -53,8 +56,8 @@ global _start
 
     ; the ordinary path: the slot the drain above just popped, reloaded and
     ; read inline -- fld always writes a fresh tag on the slot it pushes
-    ; into, so this must read back correctly whichever way the invariant
-    ; above is implemented.
+    ; into, so this must read back correctly regardless of the stale bits
+    ; the pop left standing underneath it.
     fld dword [esp+4]                     ; reload 2.25 into the slot just freed
     fchs                                  ; -2.25, read inline
     fstp dword [esp+24]                   ; -2.25

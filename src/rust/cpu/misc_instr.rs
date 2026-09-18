@@ -1,7 +1,7 @@
 use crate::cpu::cpu::*;
 use crate::cpu::fpu::{
-    fpu_clear_tag, fpu_load_m80, fpu_load_status_word, fpu_set_status_word, fpu_store_m80,
-    fpu_write_st_at, set_control_word,
+    fpu_load_m80, fpu_load_status_word, fpu_set_status_word, fpu_store_m80, fpu_write_st_at,
+    set_control_word,
 };
 use crate::cpu::global_pointers::*;
 use crate::paging::OrPageFault;
@@ -425,13 +425,6 @@ pub unsafe fn fxrstor(addr: i32) {
             fpu_load_m80(addr + 32 + (i << 4)).unwrap(),
             X87_SITE_FXRSTOR,
         );
-        // The image holds real bits for every register regardless of its
-        // tag, and fpu_write_st_at may re-tag a value that happens to
-        // round-trip through a double exactly -- the abridged tag byte read
-        // above already decided which registers are empty.
-        if 0 != *fpu_stack_empty >> reg_index & 1 {
-            fpu_clear_tag(reg_index);
-        }
     }
 
     for i in 0..8 {
