@@ -222,7 +222,9 @@ impl WasmBuilder {
 
         dbg_assert!(
             self.local_count as usize
-                == self.free_locals_i32.len() + self.free_locals_i64.len() + self.free_locals_f64.len(),
+                == self.free_locals_i32.len()
+                    + self.free_locals_i64.len()
+                    + self.free_locals_f64.len(),
             "All locals should have been freed"
         );
 
