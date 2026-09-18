@@ -3013,34 +3013,18 @@ fn gen_fpu_st_addr(ctx: &mut JitContext, i: u32) -> WasmLocal {
     addr
 }
 
-/// Pushes whether the register at `addr` holds a tagged double: not marked
-/// empty, and its tag word reads the marker generated code writes. A pop
-/// leaves the tag word of the register it emptied unchanged -- the
-/// interpreter's `fpu_tagged` checks the stack-empty bit for exactly that
-/// reason, and an inline arm that skipped it would read a stale tagged
-/// double out of a register hardware sees as empty, taking the fast path
-/// where a stack fault belongs.
+/// Pushes whether the register at `addr` holds a tagged double: its tag word
+/// reads the marker generated code writes. Every writer that marks a slot
+/// empty (`fpu_pop`/`gen_fpu_pop`, `ffree`, `finit`, `fpu_set_tag_word`,
+/// `fldenv`/`frstor`/`fxrstor`) also clears that slot's tag word, so a
+/// register hardware sees as empty never carries the tag on this side
+/// either, and the tag word alone is the whole answer -- no separate
+/// empty-bit read.
 fn gen_fpu_tag_ok(ctx: &mut JitContext, addr: &WasmLocal) {
-    ctx.builder.get_local(addr);
-    ctx.builder.const_i32(global_pointers::fpu_st as i32);
-    ctx.builder.sub_i32();
-    ctx.builder.const_i32(4);
-    ctx.builder.shr_u_i32();
-    let index = ctx.builder.set_new_local();
-    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
-    ctx.builder.get_local(&index);
-    ctx.builder.shr_u_i32();
-    ctx.builder.const_i32(1);
-    ctx.builder.and_i32();
-    ctx.builder.eqz_i32();
-    ctx.builder.free_local(index);
-
     ctx.builder.get_local(addr);
     ctx.builder.load_unaligned_u16(8);
     ctx.builder.const_i32(FPU_RELAXED_TAG);
     ctx.builder.eq_i32();
-
-    ctx.builder.and_i32();
 }
 
 fn gen_fpu_load_tagged_f64(ctx: &mut JitContext, addr: &WasmLocal) {
@@ -3298,7 +3282,9 @@ pub fn gen_fpu_binop_sti(
     ctx.builder.block_end();
 }
 
-/// Pops the stack: the top slot marked empty and the pointer moved on.
+/// Pops the stack: the top slot marked empty, its tag word cleared so it
+/// does not go on reading as the tagged double it may still hold, and the
+/// pointer moved on.
 pub fn gen_fpu_pop(ctx: &mut JitContext) {
     if !crate::jit::fpu_inline_enabled() {
         ctx.builder.call_fn0("fpu_pop");
@@ -3313,6 +3299,12 @@ pub fn gen_fpu_pop(ctx: &mut JitContext) {
     ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
     ctx.builder.or_i32();
     ctx.builder.store_u8(0);
+    ctx.builder.get_local(&ptr);
+    ctx.builder.const_i32(16);
+    ctx.builder.mul_i32();
+    ctx.builder.const_i32(0);
+    ctx.builder
+        .store_unaligned_u16(global_pointers::fpu_st as u32 + 8);
     ctx.builder.const_i32(global_pointers::fpu_stack_ptr as i32);
     ctx.builder.get_local(&ptr);
     ctx.builder.const_i32(1);

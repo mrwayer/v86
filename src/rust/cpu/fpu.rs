@@ -90,11 +90,20 @@ pub fn fpu_canonical(x: F80) -> F80 {
 /// so that one switch is the control run for interpreted code as it is for
 /// compiled.
 unsafe fn fpu_tagged(index: i32) -> Option<f64> {
-    if !crate::jit::fpu_inline_enabled() || 0 != *fpu_stack_empty >> index & 1 {
+    if !crate::jit::fpu_inline_enabled() {
         return None;
     }
     let r = *fpu_st.offset(index as isize);
     if r.sign_exponent == FPU_RELAXED_TAG { Some(f64::from_bits(r.mantissa)) } else { None }
+}
+
+/// Clears the tag word of the register at `index`: every writer that marks a
+/// slot empty calls this, so that a slot's sign-exponent word is never
+/// `FPU_RELAXED_TAG` while `fpu_stack_empty` says it is empty, and
+/// `fpu_tagged`/`gen_fpu_tag_ok` can trust the tag word alone without also
+/// consulting the empty bit a pop would otherwise leave stale.
+pub(crate) unsafe fn fpu_clear_tag(index: i32) {
+    (*fpu_st.offset(index as isize)).sign_exponent = 0;
 }
 
 unsafe fn fpu_write_tagged(index: i32, value: f64) {
@@ -448,6 +457,7 @@ pub unsafe fn fpu_fcomip(r: i32) {
 pub unsafe fn fpu_pop() {
     dbg_assert!(*fpu_stack_ptr < 8);
     *fpu_stack_empty |= 1 << *fpu_stack_ptr;
+    fpu_clear_tag(*fpu_stack_ptr as i32);
     *fpu_stack_ptr = *fpu_stack_ptr + 1 & 7;
 }
 
@@ -472,7 +482,11 @@ pub unsafe fn fpu_fdivr(target_index: i32, val: F80) {
     *fpu_status_word |= F80::get_exception_flags() as u16;
 }
 #[no_mangle]
-pub unsafe fn fpu_ffree(r: i32) { *fpu_stack_empty |= 1 << (*fpu_stack_ptr as i32 + r & 7); }
+pub unsafe fn fpu_ffree(r: i32) {
+    let index = *fpu_stack_ptr as i32 + r & 7;
+    *fpu_stack_empty |= 1 << index;
+    fpu_clear_tag(index);
+}
 
 pub unsafe fn fpu_fildm16(addr: i32) {
     fpu_push_at(return_on_pagefault!(fpu_load_i16(addr)), X87_SITE_FILD_M16)
@@ -506,6 +520,9 @@ pub unsafe fn fpu_finit() {
     *fpu_dp = 0;
     *fpu_opcode = 0;
     *fpu_stack_empty = 0xFF;
+    for i in 0..8 {
+        fpu_clear_tag(i);
+    }
     *fpu_stack_ptr = 0;
 }
 
@@ -679,6 +696,9 @@ pub unsafe fn fpu_set_tag_word(tag_word: i32) {
     for i in 0..8 {
         let empty = tag_word >> (2 * i) & 3 == 3;
         *fpu_stack_empty |= (empty as u8) << i;
+        if empty {
+            fpu_clear_tag(i);
+        }
     }
 }
 pub unsafe fn fpu_set_status_word(sw: u16) {
@@ -790,6 +810,14 @@ pub unsafe fn fpu_frstor32(mut addr: i32) {
     for i in 0..8 {
         let reg_index = *fpu_stack_ptr as i32 + i & 7;
         fpu_write_st_at(reg_index, fpu_load_m80(addr).unwrap(), X87_SITE_FRSTOR);
+        // The disk image holds real bits for every register regardless of
+        // its tag, and fpu_write_st_at may re-tag a value that happens to
+        // round-trip through a double exactly -- fpu_fldenv32 already
+        // decided which registers are empty, and this write must not
+        // contradict it.
+        if 0 != *fpu_stack_empty >> reg_index & 1 {
+            fpu_clear_tag(reg_index);
+        }
         addr += 10;
     }
 }
