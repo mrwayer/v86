@@ -3037,7 +3037,8 @@ fn gen_fpu_st_index_addr(ctx: &mut JitContext, i: u32) -> (WasmLocal, WasmLocal)
 /// every caller already has the index from computing the address in the
 /// first place, so passing it removes that recovery instead.
 fn gen_fpu_tag_ok(ctx: &mut JitContext, addr: &WasmLocal, index: &WasmLocal) {
-    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_stack_empty as u32);
     ctx.builder.get_local(index);
     ctx.builder.shr_u_i32();
     ctx.builder.const_i32(1);
