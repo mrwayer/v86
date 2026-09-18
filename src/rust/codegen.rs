@@ -16,7 +16,7 @@ use crate::opstats;
 use crate::profiler;
 use crate::regs;
 use crate::softfloat::F80;
-use crate::wasmgen::wasm_builder::{Label, WasmBuilder, WasmLocal, WasmLocalI64};
+use crate::wasmgen::wasm_builder::{Label, WasmBuilder, WasmLocal, WasmLocalF64, WasmLocalI64};
 
 pub fn gen_add_cs_offset(ctx: &mut JitContext) {
     if !ctx.cpu.has_flat_segmentation() {
@@ -3097,6 +3097,30 @@ fn gen_fpu_narrowed_ok(ctx: &mut JitContext, single: &WasmLocal, double: &WasmLo
     ctx.builder.and_i32();
 }
 
+/// Pushes whether `r` is a normal or a zero, tested on the value itself
+/// rather than on its reinterpreted bits: `|r|` between the smallest normal
+/// and the largest finite double, or `r` exactly zero. A NaN fails both
+/// compares and both is-zero tests, so it takes neither arm -- the same
+/// outcome the bit-pattern test gave, at a third less of it (13 ops against
+/// the reinterpret/local/classify/reinterpret chain's 18): `tee_new_local_f64`
+/// keeps the one `abs` computed for every compare that needs it.
+fn gen_fpu_f64_result_ok(ctx: &mut JitContext, r: &WasmLocalF64) {
+    ctx.builder.get_local_f64(r);
+    ctx.builder.abs_f64();
+    let abs = ctx.builder.tee_new_local_f64();
+    ctx.builder.const_f64(f64::MIN_POSITIVE);
+    ctx.builder.ge_f64();
+    ctx.builder.get_local_f64(&abs);
+    ctx.builder.const_f64(f64::MAX);
+    ctx.builder.le_f64();
+    ctx.builder.and_i32();
+    ctx.builder.get_local_f64(&abs);
+    ctx.builder.const_f64(0.0);
+    ctx.builder.eq_f64();
+    ctx.builder.or_i32();
+    ctx.builder.free_local_f64(abs);
+}
+
 /// The result of an inline arithmetic arm, on the stack as a double, into
 /// the register at `target`, which already carries the tag, and out through
 /// `done` -- when the result is one the arm may keep; otherwise it falls
@@ -3107,18 +3131,25 @@ fn gen_fpu_narrowed_ok(ctx: &mut JitContext, single: &WasmLocal, double: &WasmLo
 /// instruction rounds its result to 24 bits and a result outside the
 /// single's range keeps the format's wider exponent, which only the library
 /// holds. The narrowing is the 24-bit rounding of the exact result: the
-/// double holds more than twice the bits, so the two roundings agree.
+/// double holds more than twice the bits, so the two roundings agree. The
+/// result is kept in an `f64` local -- the 24-bit path still needs its bits
+/// for the exact-zero test `gen_fpu_narrowed_ok` makes, but the ordinary
+/// path classifies the value itself and feeds it to the store directly,
+/// without ever reinterpreting it to an integer.
 fn gen_fpu_arm_result(ctx: &mut JitContext, target: &WasmLocal, done: Label) {
-    ctx.builder.reinterpret_f64_as_i64();
-    let result = ctx.builder.set_new_local_i64();
+    let result = ctx.builder.set_new_local_f64();
     ctx.builder
         .load_fixed_u8(global_pointers::fpu_precision_single as u32);
     ctx.builder.if_void();
-    gen_get_f64(ctx, &result);
+    ctx.builder.get_local_f64(&result);
     ctx.builder.demote_f64_to_f32();
     ctx.builder.reinterpret_f32_as_i32();
     let single = ctx.builder.set_new_local();
-    gen_fpu_narrowed_ok(ctx, &single, &result);
+    ctx.builder.get_local_f64(&result);
+    ctx.builder.reinterpret_f64_as_i64();
+    let double = ctx.builder.set_new_local_i64();
+    gen_fpu_narrowed_ok(ctx, &single, &double);
+    ctx.builder.free_local_i64(double);
     ctx.builder.if_void();
     ctx.builder.get_local(&single);
     ctx.builder.reinterpret_i32_as_f32();
@@ -3128,14 +3159,14 @@ fn gen_fpu_arm_result(ctx: &mut JitContext, target: &WasmLocal, done: Label) {
     ctx.builder.block_end();
     ctx.builder.free_local(single);
     ctx.builder.else_();
-    gen_fpu_f64_bits_ok(ctx, &result);
+    gen_fpu_f64_result_ok(ctx, &result);
     ctx.builder.if_void();
-    gen_get_f64(ctx, &result);
+    ctx.builder.get_local_f64(&result);
     gen_fpu_store_f64_keeping_tag(ctx, target);
     ctx.builder.br(done);
     ctx.builder.block_end();
     ctx.builder.block_end();
-    ctx.builder.free_local_i64(result);
+    ctx.builder.free_local_f64(result);
 }
 
 /// The bits of an x87 memory operand, as read, in a local of the width the

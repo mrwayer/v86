@@ -96,6 +96,7 @@ pub struct WasmBuilder {
 
     free_locals_i32: Vec<WasmLocal>,
     free_locals_i64: Vec<WasmLocalI64>,
+    free_locals_f64: Vec<WasmLocalF64>,
     local_count: u8,
     pub arg_local_initial_state: WasmLocal,
 }
@@ -111,6 +112,11 @@ impl WasmLocal {
 
 pub struct WasmLocalI64(u8);
 impl WasmLocalI64 {
+    pub fn idx(&self) -> u8 { self.0 }
+}
+
+pub struct WasmLocalF64(u8);
+impl WasmLocalF64 {
     pub fn idx(&self) -> u8 { self.0 }
 }
 
@@ -144,6 +150,7 @@ impl WasmBuilder {
 
             free_locals_i32: Vec::with_capacity(8),
             free_locals_i64: Vec::with_capacity(8),
+            free_locals_f64: Vec::with_capacity(8),
             local_count: 0,
             arg_local_initial_state: WasmLocal(0),
         };
@@ -176,6 +183,7 @@ impl WasmBuilder {
         self.instruction_body.clear();
         self.free_locals_i32.clear();
         self.free_locals_i64.clear();
+        self.free_locals_f64.clear();
         self.local_count = 0;
 
         dbg_assert!(self.label_to_depth.is_empty());
@@ -213,17 +221,22 @@ impl WasmBuilder {
         self.output.push(0);
 
         dbg_assert!(
-            self.local_count as usize == self.free_locals_i32.len() + self.free_locals_i64.len(),
+            self.local_count as usize
+                == self.free_locals_i32.len() + self.free_locals_i64.len() + self.free_locals_f64.len(),
             "All locals should have been freed"
         );
 
         let free_locals_i32 = &self.free_locals_i32;
         let free_locals_i64 = &self.free_locals_i64;
+        let free_locals_f64 = &self.free_locals_f64;
 
         let locals = (0..self.local_count).map(|i| {
             let local_index = WASM_MODULE_ARGUMENT_COUNT + i;
             if free_locals_i64.iter().any(|v| v.idx() == local_index) {
                 op::TYPE_I64
+            }
+            else if free_locals_f64.iter().any(|v| v.idx() == local_index) {
+                op::TYPE_F64
             }
             else {
                 dbg_assert!(free_locals_i32.iter().any(|v| v.idx() == local_index));
@@ -684,6 +697,43 @@ impl WasmBuilder {
         self.instruction_body.push(local.idx());
     }
 
+    #[must_use = "local allocated but not used"]
+    fn alloc_local_f64(&mut self) -> WasmLocalF64 {
+        match self.free_locals_f64.pop() {
+            Some(local) => local,
+            None => {
+                let new_idx = self.local_count + WASM_MODULE_ARGUMENT_COUNT;
+                self.local_count = self.local_count.checked_add(1).unwrap();
+                WasmLocalF64(new_idx)
+            },
+        }
+    }
+    pub fn free_local_f64(&mut self, local: WasmLocalF64) {
+        dbg_assert!(
+            (WASM_MODULE_ARGUMENT_COUNT..self.local_count + WASM_MODULE_ARGUMENT_COUNT)
+                .contains(&local.0)
+        );
+        self.free_locals_f64.push(local)
+    }
+    #[must_use = "local allocated but not used"]
+    pub fn set_new_local_f64(&mut self) -> WasmLocalF64 {
+        let local = self.alloc_local_f64();
+        self.instruction_body.push(op::OP_SETLOCAL);
+        self.instruction_body.push(local.idx());
+        local
+    }
+    #[must_use = "local allocated but not used"]
+    pub fn tee_new_local_f64(&mut self) -> WasmLocalF64 {
+        let local = self.alloc_local_f64();
+        self.instruction_body.push(op::OP_TEELOCAL);
+        self.instruction_body.push(local.idx());
+        local
+    }
+    pub fn get_local_f64(&mut self, local: &WasmLocalF64) {
+        self.instruction_body.push(op::OP_GETLOCAL);
+        self.instruction_body.push(local.idx());
+    }
+
     pub fn const_i32(&mut self, v: i32) {
         self.instruction_body.push(op::OP_I32CONST);
         write_leb_i32(&mut self.instruction_body, v);
@@ -948,6 +998,7 @@ impl WasmBuilder {
     pub fn eq_f64(&mut self) { self.instruction_body.push(op::OP_F64EQ); }
     pub fn lt_f64(&mut self) { self.instruction_body.push(op::OP_F64LT); }
     pub fn le_f64(&mut self) { self.instruction_body.push(op::OP_F64LE); }
+    pub fn ge_f64(&mut self) { self.instruction_body.push(op::OP_F64GE); }
     /// Only for a value already known to be in range: out of it, wasm traps.
     pub fn trunc_f64_to_i32(&mut self) { self.instruction_body.push(op::OP_I32TRUNCSF64); }
     pub fn convert_i32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI32); }
