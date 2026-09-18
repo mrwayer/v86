@@ -70,25 +70,45 @@ global _start
     fstp dword [esp+156]                  ; 2.25, top 7
     fstp st0                              ; top 0
 
-    ; the top moved by fdecstp and fincstp, and an inline push between them
+    ; the top moved by fdecstp and fincstp, and an inline push between them.
+    ; The status word's TOP field is checked right after each pointer move
+    ; (masked to bits 13:11, nothing else touched by fdecstp/fincstp) so a
+    ; mismatch names the instruction, not the fixture's end state.
     finit
     fld dword [esp]                       ; 1.5, top 7
     fld dword [esp+4]                     ; 2.25, top 6
     fdecstp                               ; top 5, its slot empty
+    xor eax, eax
+    fnstsw ax
+    and eax, 0x3800
+    mov [esp+160], eax                    ; TOP 5 -> 0x2800
     fld dword [esp+8]                     ; 7.5 at top 4
-    fstp dword [esp+160]                  ; top 5
+    fstp dword [esp+164]                  ; top 5
     fincstp                               ; top 6: 2.25 is st(0) again
-    fstp dword [esp+164]                  ; 2.25, top 7
-    fstp dword [esp+168]                  ; 1.5, top 0
+    xor eax, eax
+    fnstsw ax
+    and eax, 0x3800
+    mov [esp+168], eax                    ; TOP 6 -> 0x3000
+    fstp dword [esp+172]                  ; 2.25, top 7
+    fstp dword [esp+176]                  ; 1.5, top 0
 
-    ; emms after a push: every slot empty, the top where it was, then an
-    ; inline push and fincstp moving past the slot it just drained
+    ; emms after a push: every slot empty, the top where it was (emms moves
+    ; no pointer -- only fpu_set_tag_word, checked here too), then an inline
+    ; push and a fincstp moving past the slot it just drained
     finit
     fld dword [esp]                       ; 1.5, top 7
     emms
+    xor eax, eax
+    fnstsw ax
+    and eax, 0x3800
+    mov [esp+180], eax                    ; TOP still 7 -> 0x3800
     fld dword [esp+4]                     ; 2.25 at top 6
-    fstp dword [esp+172]                  ; top 7, its slot empty since emms
+    fstp dword [esp+184]                  ; top 7, its slot empty since emms
     fincstp                               ; top 0
+    xor eax, eax
+    fnstsw ax
+    and eax, 0x3800
+    mov [esp+188], eax                    ; TOP 0 -> 0x0
     fld dword [esp]                       ; 1.5, top 7: the final, compared state
 
 %include "footer.inc"
