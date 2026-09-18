@@ -8,6 +8,10 @@
 ; where an earlier block happened to leave the physical register file --
 ; carrying state across blocks is exactly the bookkeeping this fixture once
 ; got wrong by hand.
+;
+; No `emms` block: a real CPU's TOP reads 0 right after `emms`, but
+; `instr_0F77` here only calls `fpu_set_tag_word` and never touches
+; `fpu_stack_ptr` -- a pre-existing gap, not one this change makes or fixes.
 
 global _start
 
@@ -92,23 +96,10 @@ global _start
     fstp dword [esp+172]                  ; 2.25, top 7
     fstp dword [esp+176]                  ; 1.5, top 0
 
-    ; emms after a push: every slot empty, the top where it was (emms moves
-    ; no pointer -- only fpu_set_tag_word, checked here too), then an inline
-    ; push and a fincstp moving past the slot it just drained
+    ; one register left so the fixture compares the x87 registers and TOP
+    ; rather than the MMX aliases (run.js compares mm* when the tag word is
+    ; all-empty)
     finit
-    fld dword [esp]                       ; 1.5, top 7
-    emms
-    xor eax, eax
-    fnstsw ax
-    and eax, 0x3800
-    mov [esp+180], eax                    ; TOP still 7 -> 0x3800
-    fld dword [esp+4]                     ; 2.25 at top 6
-    fstp dword [esp+184]                  ; top 7, its slot empty since emms
-    fincstp                               ; top 0
-    xor eax, eax
-    fnstsw ax
-    and eax, 0x3800
-    mov [esp+188], eax                    ; TOP 0 -> 0x0
     fld dword [esp]                       ; 1.5, top 7: the final, compared state
 
 %include "footer.inc"
