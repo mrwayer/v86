@@ -3005,8 +3005,10 @@ fn gen_fpu_st_index_addr_from(
         ctx.builder.const_i32(7);
         ctx.builder.and_i32();
     }
+    // `tee_new_local` stores the index and leaves it on the stack too, for
+    // the multiply right below -- an extra `get_local` here would leave a
+    // stray value the module's own validator rejects the whole module for.
     let index = ctx.builder.tee_new_local();
-    ctx.builder.get_local(&index);
     ctx.builder.const_i32(16);
     ctx.builder.mul_i32();
     ctx.builder.const_i32(global_pointers::fpu_st as i32);
