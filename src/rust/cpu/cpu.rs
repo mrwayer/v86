@@ -3786,6 +3786,44 @@ pub unsafe fn at_handoff_page(eip: u32) -> bool {
     handoff_pages[(page >> 3) as usize] & (1u8 << (page & 7)) != 0
 }
 
+/// The co-executor's entry hash, as a physical address in guest memory, or 0
+/// for none: open addressing over the guest address in 65 536 slots of 12
+/// bytes, the address first, an empty slot holding 0 and a removed one all
+/// ones. With it set, a slice returns only at an address the co-executor has
+/// an entry for, not anywhere in a page it holds code in: a page half
+/// translated would otherwise hand the guest back one instruction at a
+/// time.
+pub static mut handoff_hash: u32 = 0;
+
+#[no_mangle]
+pub unsafe fn bottlify_handoff_hash(physical: u32) { handoff_hash = physical }
+
+const HANDOFF_HASH_SLOTS: u32 = 65536;
+const HANDOFF_HASH_SLOT: u32 = 12;
+
+#[inline]
+pub unsafe fn hash_holds(table: *const u8, eip: u32) -> bool {
+    let mut slot = eip.wrapping_mul(0x9e3779b1) >> 16;
+    loop {
+        let key = std::ptr::read_unaligned(
+            table.offset((slot * HANDOFF_HASH_SLOT) as isize) as *const u32,
+        );
+        if key == eip {
+            return true;
+        }
+        if key == 0 {
+            return false;
+        }
+        slot = (slot + 1) & (HANDOFF_HASH_SLOTS - 1);
+    }
+}
+
+#[inline]
+pub unsafe fn at_handoff(eip: u32) -> bool {
+    at_handoff_page(eip)
+        && (handoff_hash == 0 || hash_holds(memory::mem8.offset(handoff_hash as isize), eip))
+}
+
 /// Where the byte-per-page "has compiled code" table lives, for a
 /// co-executor to read alongside its own page flags: a store it makes into a
 /// page the emulator compiled must reach jit_dirty_cache as the emulator's
@@ -3805,7 +3843,7 @@ pub unsafe fn run_slice(max_instructions: u32) -> u32 {
         if retired >= max_instructions || *in_hlt {
             break;
         }
-        if retired != 0 && at_handoff_page(*instruction_pointer as u32) {
+        if retired != 0 && at_handoff(*instruction_pointer as u32) {
             break;
         }
         // Never above the ceiling the compiler was built around, and never
@@ -5197,6 +5235,42 @@ mod handoff_tests {
             // A page number past the space is ignored, not written.
             bottlify_handoff_page(0x100000, 1);
             assert!(!at_handoff_page(0));
+        }
+    }
+
+    #[test]
+    fn the_hash_is_probed_as_the_co_executor_fills_it() {
+        let mut table = vec![0u8; (HANDOFF_HASH_SLOTS * HANDOFF_HASH_SLOT) as usize];
+        let put = |table: &mut Vec<u8>, eip: u32| {
+            let mut slot = eip.wrapping_mul(0x9e3779b1) >> 16;
+            loop {
+                let at = (slot * HANDOFF_HASH_SLOT) as usize;
+                let key = u32::from_le_bytes([table[at], table[at + 1], table[at + 2], table[at + 3]]);
+                if key == 0 || key == 0xffffffff {
+                    table[at..at + 4].copy_from_slice(&eip.to_le_bytes());
+                    return;
+                }
+                slot = (slot + 1) & (HANDOFF_HASH_SLOTS - 1);
+            }
+        };
+        // Two addresses that share a slot, one of them later removed.
+        let a = 0x401000u32;
+        let mut b = a + 1;
+        while b.wrapping_mul(0x9e3779b1) >> 16 != a.wrapping_mul(0x9e3779b1) >> 16 {
+            b += 1;
+        }
+        put(&mut table, a);
+        put(&mut table, b);
+        put(&mut table, 0x8000);
+        unsafe {
+            assert!(hash_holds(table.as_ptr(), a));
+            assert!(hash_holds(table.as_ptr(), b));
+            assert!(hash_holds(table.as_ptr(), 0x8000));
+            assert!(!hash_holds(table.as_ptr(), a + 4));
+            let at = ((a.wrapping_mul(0x9e3779b1) >> 16) * HANDOFF_HASH_SLOT) as usize;
+            table[at..at + 4].copy_from_slice(&0xffffffffu32.to_le_bytes());
+            assert!(!hash_holds(table.as_ptr(), a), "removed");
+            assert!(hash_holds(table.as_ptr(), b), "found past the removed slot");
         }
     }
 }
