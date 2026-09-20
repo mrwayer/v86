@@ -2668,7 +2668,7 @@ pub fn jit_increase_hotness_and_maybe_compile(
     // A page a co-executor holds translated code for is left interpreted:
     // compiled code would run through its entries without the slice loop's
     // handoff check.
-    if unsafe { cpu::at_handoff_page(virt_address) } {
+    if unsafe { cpu::at_handoff_page(virt_address as u32) } {
         return;
     }
 
