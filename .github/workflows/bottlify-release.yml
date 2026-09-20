@@ -53,6 +53,19 @@ jobs:
           make with-profiler
           cp build/v86.wasm out/v86-profiler.wasm
           cp bios/seabios.bin bios/vgabios.bin out/
+
+      # The nasm instruction corpus, assembled and run on this runner's own
+      # processor under gdb, as one document: every case's ELF image with the
+      # register and memory state real hardware left behind. Bottlify's
+      # translator tests fetch it and run the same cases against their own
+      # machine, having neither nasm nor gdb where they run.
+      - name: Build the nasm corpus
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm gdb libc6-dev-i386
+          tests/nasm/create_tests.js
+          tests/nasm/gen_fixtures.js
+          node tests/nasm/pack-corpus.mjs out/nasm-corpus.json.gz
           cd out
           sha256sum * | tee SHA256SUMS
 
