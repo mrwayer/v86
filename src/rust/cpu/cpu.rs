@@ -3625,6 +3625,9 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32) {
             // thousand retiring two hundred thousand, with nothing compiled in the
             // second hundred thousand.
             || i >= *jit_loop_counter as u32
+            // A co-executor's entry: this loop returns there as run_slice's
+            // does, so the slice can hand the guest over at once.
+            || at_handoff(*instruction_pointer as u32)
         {
             break;
         }
@@ -3780,7 +3783,9 @@ pub unsafe fn bottlify_handoff_page(page: u32, on: u32) {
         // loop, where the handoff is checked, so a page the co-executor holds
         // is interpreted here, one dispatch per instruction, until it is
         // handed over.
-        jit::jit_dirty_page(Page::page_of(page << 12));
+        if page < 0xfffff {
+            jit::jit_dirty_cache(page << 12, (page + 1) << 12);
+        }
     }
     else {
         handoff_pages[index] &= !bit
