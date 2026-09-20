@@ -2665,6 +2665,12 @@ pub fn jit_increase_hotness_and_maybe_compile(
     if unsafe { JIT_DISABLED } {
         return;
     }
+    // A page a co-executor holds translated code for is left interpreted:
+    // compiled code would run through its entries without the slice loop's
+    // handoff check.
+    if unsafe { cpu::at_handoff_page(virt_address) } {
+        return;
+    }
 
     let mut ctx = get_jit_state();
     let is_compiling = ctx.compiling.is_some();

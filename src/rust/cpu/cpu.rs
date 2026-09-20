@@ -3773,7 +3773,14 @@ pub unsafe fn bottlify_handoff_page(page: u32, on: u32) {
     }
     let bit = 1u8 << (page & 7);
     if on != 0 {
-        handoff_pages[index] |= bit
+        handoff_pages[index] |= bit;
+        // What this emulator compiled for the page is dropped, and the page
+        // is not compiled again while flagged (the hotness check refuses it):
+        // generated code runs a page's blocks without returning to the slice
+        // loop, where the handoff is checked, so a page the co-executor holds
+        // is interpreted here, one dispatch per instruction, until it is
+        // handed over.
+        jit::jit_dirty_page(Page::page_of(page << 12));
     }
     else {
         handoff_pages[index] &= !bit
