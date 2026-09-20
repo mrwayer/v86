@@ -3755,6 +3755,44 @@ pub unsafe fn do_many_cycles_native() {
 pub static mut slice_start: u32 = 0;
 pub static mut slice_bound: u32 = 0;
 
+/// Pages a co-executor holds translated code for, one bit per 4 KiB page of
+/// the address space. A slice that arrives at such a page after retiring
+/// something returns to its caller, which can hand the guest to the
+/// translator at once instead of letting the emulator run through code the
+/// translator has to a boundary of the emulator's own. The check is one
+/// bit test per dispatch, never per instruction, and a slice always makes
+/// progress first: it cannot return empty-handed at a flagged page it was
+/// started on.
+pub static mut handoff_pages: [u8; 0x20000] = [0; 0x20000];
+
+#[no_mangle]
+pub unsafe fn bottlify_handoff_page(page: u32, on: u32) {
+    let index = (page >> 3) as usize;
+    if index >= 0x20000 {
+        return;
+    }
+    let bit = 1u8 << (page & 7);
+    if on != 0 {
+        handoff_pages[index] |= bit
+    }
+    else {
+        handoff_pages[index] &= !bit
+    }
+}
+
+#[inline]
+pub unsafe fn at_handoff_page(eip: u32) -> bool {
+    let page = eip >> 12;
+    handoff_pages[(page >> 3) as usize] & (1u8 << (page & 7)) != 0
+}
+
+/// Where the byte-per-page "has compiled code" table lives, for a
+/// co-executor to read alongside its own page flags: a store it makes into a
+/// page the emulator compiled must reach jit_dirty_cache as the emulator's
+/// own stores do.
+#[no_mangle]
+pub unsafe fn bottlify_page_has_code_ptr() -> u32 { &page_has_code[0] as *const u8 as u32 }
+
 #[no_mangle]
 pub unsafe fn run_slice(max_instructions: u32) -> u32 {
     let outer_bound = *jit_loop_counter;
@@ -3765,6 +3803,9 @@ pub unsafe fn run_slice(max_instructions: u32) -> u32 {
     loop {
         let retired = (*instruction_counter).wrapping_sub(start);
         if retired >= max_instructions || *in_hlt {
+            break;
+        }
+        if retired != 0 && at_handoff_page(*instruction_pointer as u32) {
             break;
         }
         // Never above the ceiling the compiler was built around, and never
@@ -5134,3 +5175,28 @@ pub unsafe fn reset_cpu() {
 
 #[no_mangle]
 pub unsafe fn set_cpuid_level(level: u32) { cpuid_level = level }
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+
+    #[test]
+    fn a_page_is_flagged_and_cleared_by_its_number() {
+        unsafe {
+            bottlify_handoff_page(0x8, 1);
+            bottlify_handoff_page(0xfffff, 1);
+            assert!(at_handoff_page(0x8000));
+            assert!(at_handoff_page(0x8fff));
+            assert!(!at_handoff_page(0x7fff));
+            assert!(!at_handoff_page(0x9000));
+            assert!(at_handoff_page(0xfffff000));
+            bottlify_handoff_page(0x8, 0);
+            assert!(!at_handoff_page(0x8000));
+            assert!(at_handoff_page(0xfffff000));
+            bottlify_handoff_page(0xfffff, 0);
+            // A page number past the space is ignored, not written.
+            bottlify_handoff_page(0x100000, 1);
+            assert!(!at_handoff_page(0));
+        }
+    }
+}
